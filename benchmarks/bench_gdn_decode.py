@@ -1166,6 +1166,7 @@ def bench_gdn_mtp(
     use_beta: bool = True,
     use_qk_l2norm: bool = True,
     cache_intermediate_states: bool = True,
+    cache_stride: int = 1,
     disable_state_update: bool = True,
     warmup_iters: int = 10,
     bench_iters: int = 100,
@@ -1208,9 +1209,10 @@ def bench_gdn_mtp(
 
     # Intermediate states buffer (optional)
     if cache_intermediate_states:
+        cache_steps = T // cache_stride if cache_stride > 1 else T
         intermediate_states_buffer = torch.zeros(
             pool_size,
-            T,
+            cache_steps,
             num_sab_heads,
             head_size,
             head_size,
@@ -1245,6 +1247,7 @@ def bench_gdn_mtp(
             intermediate_states_buffer,
             disable_state_update=disable_state_update,
             use_qk_l2norm=use_qk_l2norm,
+            cache_stride=cache_stride,
         ),
         enable_cupti=True,
         dry_run_iters=warmup_iters,
@@ -2401,6 +2404,7 @@ def run_flashinfer_only_benchmark(args, dtype, use_qk_l2norm):
                 f"v={args.num_v_heads}, d={args.head_size}, dtype={args.dtype}, "
                 f"qk_l2norm={'ON' if use_qk_l2norm else 'OFF'}, "
                 f"cache_intermediate={'ON' if args.cache_intermediate_states else 'OFF'}, "
+                f"cache_stride={args.cache_stride}, "
                 f"update_state={'ON' if args.update_state else 'OFF'})"
             )
             print("-" * 100)
@@ -2421,6 +2425,7 @@ def run_flashinfer_only_benchmark(args, dtype, use_qk_l2norm):
                         dtype=dtype,
                         use_qk_l2norm=use_qk_l2norm,
                         cache_intermediate_states=args.cache_intermediate_states,
+                        cache_stride=args.cache_stride,
                         disable_state_update=not args.update_state,
                         warmup_iters=args.warmup,
                         bench_iters=args.iters,
@@ -2738,6 +2743,12 @@ Examples:
         "--cache-intermediate-states",
         action="store_true",
         help="Cache intermediate states for MTP benchmark",
+    )
+    parser.add_argument(
+        "--cache-stride",
+        type=int,
+        default=1,
+        help="Cache stride for intermediate states (1=every step, 2=every 2nd, 4=every 4th, 8=every 8th)",
     )
     parser.add_argument(
         "--update-state",

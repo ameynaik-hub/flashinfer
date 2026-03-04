@@ -2098,6 +2098,9 @@ def gdn_verify_kernel_mtp_original(
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    cache_stride: cutlass.Constexpr[
+        int
+    ],  # 1=every step, 2=every 2nd, 4=every 4th, etc.
 ):
     """
     Original MTP kernel without ILP optimizations.
@@ -2307,13 +2310,16 @@ def gdn_verify_kernel_mtp_original(
 
                     # Cache intermediate state if needed using 3D local_tile + autovec_copy
                     if cutlass.const_expr(cache_intermediate_states):
-                        flat_idx = i_n * T * HV + i_t * HV + i_hv
-                        inter_tile = cute.local_tile(
-                            intermediate_states,
-                            (1, 1, vec_size),
-                            (flat_idx, v_idx, lane_in_group),
-                        )
-                        cute.autovec_copy(r_h, inter_tile)
+                        if (i_t + 1) % cache_stride == 0:
+                            cache_slot = (i_t + 1) // cache_stride - 1
+                            cache_steps = T // cache_stride
+                            flat_idx = i_n * cache_steps * HV + cache_slot * HV + i_hv
+                            inter_tile = cute.local_tile(
+                                intermediate_states,
+                                (1, 1, vec_size),
+                                (flat_idx, v_idx, lane_in_group),
+                            )
+                            cute.autovec_copy(r_h, inter_tile)
 
                     # Step 5: Compute output: sum_hq = h @ q (group reduction)
                     sum_hq = 0.0
@@ -2370,6 +2376,7 @@ def run_gdn_verify_kernel_mtp_original(
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    cache_stride: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
     """Launcher for original MTP kernel (BS < 8)."""
@@ -2423,6 +2430,7 @@ def run_gdn_verify_kernel_mtp_original(
         is_varlen,
         disable_state_update,
         cache_intermediate_states,
+        cache_stride,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -2463,6 +2471,9 @@ def gdn_verify_kernel_mtp(
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    cache_stride: cutlass.Constexpr[
+        int
+    ],  # 1=every step, 2=every 2nd, 4=every 4th, etc.
     ilp_rows: cutlass.Constexpr[
         int
     ],  # 1, 2, 4, or 8: number of V-rows processed simultaneously
@@ -2819,55 +2830,60 @@ def gdn_verify_kernel_mtp(
 
                         # Cache intermediate state if needed
                         if cutlass.const_expr(cache_intermediate_states):
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
-                            it0 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v0, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), it0)
-                            it1 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v1, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (1, None)), it1)
-                            it2 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v2, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (2, None)), it2)
-                            it3 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v3, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (3, None)), it3)
-                            it4 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v4, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (4, None)), it4)
-                            it5 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v5, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (5, None)), it5)
-                            it6 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v6, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (6, None)), it6)
-                            it7 = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v7, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (7, None)), it7)
+                            if (i_t + 1) % cache_stride == 0:
+                                cache_slot = (i_t + 1) // cache_stride - 1
+                                cache_steps = T // cache_stride
+                                flat_idx = (
+                                    i_n * cache_steps * HV + cache_slot * HV + i_hv
+                                )
+                                it0 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v0, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (0, None)), it0)
+                                it1 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v1, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (1, None)), it1)
+                                it2 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v2, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (2, None)), it2)
+                                it3 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v3, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (3, None)), it3)
+                                it4 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v4, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (4, None)), it4)
+                                it5 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v5, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (5, None)), it5)
+                                it6 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v6, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (6, None)), it6)
+                                it7 = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v7, lane_in_group),
+                                )
+                                cute.autovec_copy(cute.slice_(r_h, (7, None)), it7)
 
                         # Step 5: Output dot products h@q for all 8 rows
                         o0 = 0.0
@@ -3096,31 +3112,44 @@ def gdn_verify_kernel_mtp(
 
                         # Cache intermediate state if needed
                         if cutlass.const_expr(cache_intermediate_states):
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
-                            inter_tile_a = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_a, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_tile_a)
-                            inter_tile_b = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_b, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
-                            inter_tile_c = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_c, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (2, None)), inter_tile_c)
-                            inter_tile_d = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_d, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (3, None)), inter_tile_d)
+                            if (i_t + 1) % cache_stride == 0:
+                                cache_slot = (i_t + 1) // cache_stride - 1
+                                cache_steps = T // cache_stride
+                                flat_idx = (
+                                    i_n * cache_steps * HV + cache_slot * HV + i_hv
+                                )
+                                inter_tile_a = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v_idx_a, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (0, None)), inter_tile_a
+                                )
+                                inter_tile_b = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v_idx_b, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (1, None)), inter_tile_b
+                                )
+                                inter_tile_c = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v_idx_c, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (2, None)), inter_tile_c
+                                )
+                                inter_tile_d = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v_idx_d, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (3, None)), inter_tile_d
+                                )
 
                         # Step 5: Compute output for ALL 4 rows (ILP)
                         sum_hq_a = 0.0
@@ -3273,19 +3302,28 @@ def gdn_verify_kernel_mtp(
 
                         # Cache intermediate state if needed
                         if cutlass.const_expr(cache_intermediate_states):
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
-                            inter_tile_a = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_a, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_tile_a)
-                            inter_tile_b = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_b, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
+                            if (i_t + 1) % cache_stride == 0:
+                                cache_slot = (i_t + 1) // cache_stride - 1
+                                cache_steps = T // cache_stride
+                                flat_idx = (
+                                    i_n * cache_steps * HV + cache_slot * HV + i_hv
+                                )
+                                inter_tile_a = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v_idx_a, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (0, None)), inter_tile_a
+                                )
+                                inter_tile_b = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v_idx_b, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (1, None)), inter_tile_b
+                                )
 
                         # Step 5: Compute output for BOTH rows (ILP)
                         sum_hq_a = 0.0
@@ -3387,13 +3425,20 @@ def gdn_verify_kernel_mtp(
 
                         # Cache intermediate state if needed
                         if cutlass.const_expr(cache_intermediate_states):
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
-                            inter_tile = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx, lane_in_group),
-                            )
-                            cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_tile)
+                            if (i_t + 1) % cache_stride == 0:
+                                cache_slot = (i_t + 1) // cache_stride - 1
+                                cache_steps = T // cache_stride
+                                flat_idx = (
+                                    i_n * cache_steps * HV + cache_slot * HV + i_hv
+                                )
+                                inter_tile = cute.local_tile(
+                                    intermediate_states,
+                                    (1, 1, vec_size),
+                                    (flat_idx, v_idx, lane_in_group),
+                                )
+                                cute.autovec_copy(
+                                    cute.slice_(r_h, (0, None)), inter_tile
+                                )
 
                         # Step 5: Output dot product h @ q
                         sum_hq = 0.0
@@ -3464,6 +3509,7 @@ def run_gdn_verify_kernel_mtp(
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    cache_stride: cutlass.Constexpr[int],
     ilp_rows: cutlass.Constexpr[int],
     use_smem_v: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
@@ -3520,6 +3566,7 @@ def run_gdn_verify_kernel_mtp(
         is_varlen,
         disable_state_update,
         cache_intermediate_states,
+        cache_stride,
         ilp_rows,
         use_smem_v,
     ).launch(
@@ -3575,6 +3622,9 @@ def gdn_verify_kernel_mtp_smem(
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    cache_stride: cutlass.Constexpr[
+        int
+    ],  # 1=every step, 2=every 2nd, 4=every 4th, etc.
 ):
     """
     SMEM-resident state MTP kernel — reduced register pressure for higher occupancy.
@@ -3810,13 +3860,16 @@ def gdn_verify_kernel_mtp_smem(
 
                     # Cache intermediate state if needed
                     if cutlass.const_expr(cache_intermediate_states):
-                        flat_idx = i_n * T * HV + i_t * HV + i_hv
-                        inter_tile = cute.local_tile(
-                            intermediate_states,
-                            (1, 1, vec_size),
-                            (flat_idx, v_idx, lane_in_group),
-                        )
-                        cute.autovec_copy(r_h, inter_tile)
+                        if (i_t + 1) % cache_stride == 0:
+                            cache_slot = (i_t + 1) // cache_stride - 1
+                            cache_steps = T // cache_stride
+                            flat_idx = i_n * cache_steps * HV + cache_slot * HV + i_hv
+                            inter_tile = cute.local_tile(
+                                intermediate_states,
+                                (1, 1, vec_size),
+                                (flat_idx, v_idx, lane_in_group),
+                            )
+                            cute.autovec_copy(r_h, inter_tile)
 
                     for offset in [16, 8, 4, 2, 1]:
                         sum_hq += cute.arch.shuffle_sync_bfly(
@@ -3874,6 +3927,7 @@ def run_gdn_verify_kernel_mtp_smem(
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    cache_stride: cutlass.Constexpr[int],
     stream: cuda.CUstream,
 ):
     _, v_dim, k_dim = (
@@ -3924,6 +3978,7 @@ def run_gdn_verify_kernel_mtp_smem(
         is_varlen,
         disable_state_update,
         cache_intermediate_states,
+        cache_stride,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_SMEM, 1, 1],
@@ -3944,6 +3999,7 @@ def _get_compiled_mtp_smem_kernel(
     cache_steps: int,
     disable_state_update: bool,
     cache_intermediate_states: bool,
+    cache_stride: int,
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,
@@ -3964,6 +4020,7 @@ def _get_compiled_mtp_kernel_original(
     cache_steps: int,
     disable_state_update: bool,
     cache_intermediate_states: bool,
+    cache_stride: int,
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,
@@ -3985,6 +4042,7 @@ def _get_compiled_mtp_kernel(
     cache_steps: int,
     disable_state_update: bool,
     cache_intermediate_states: bool,
+    cache_stride: int,
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,  # TILE_V - configurable for batch size
@@ -4012,6 +4070,7 @@ def gated_delta_rule_mtp(
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     disable_state_update: bool = False,
     use_qk_l2norm: bool = True,
+    cache_stride: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Gated Delta Rule MTP Kernel (Multiple Token Processing).
@@ -4112,10 +4171,18 @@ def gated_delta_rule_mtp(
         buffer_size = intermediate_states_buffer.shape[0]
         cache_steps = intermediate_states_buffer.shape[1]
 
-        # Validate buffer length matches query sequence length
-        assert cache_steps >= T, (
-            f"intermediate_states_buffer second dimension (cache_steps={cache_steps}) must be at least T={T} to prevent out-of-bounds indexing"
-        )
+        if cache_stride > 1:
+            # Stride mode: buffer has T//cache_stride slots per batch
+            expected_steps = T // cache_stride
+            assert cache_steps >= expected_steps, (
+                f"intermediate_states_buffer second dimension (cache_steps={cache_steps}) must be at least T//cache_stride={expected_steps}"
+            )
+            cache_steps = expected_steps
+        else:
+            # Full cache: validate buffer length matches query sequence length
+            assert cache_steps >= T, (
+                f"intermediate_states_buffer second dimension (cache_steps={cache_steps}) must be at least T={T} to prevent out-of-bounds indexing"
+            )
 
         intermediate_states = (
             intermediate_states_buffer.to(torch.float32)
@@ -4145,6 +4212,7 @@ def gated_delta_rule_mtp(
             cache_steps,
             disable_state_update,
             cache_intermediate_states,
+            cache_stride,
             scale,
             use_qk_l2norm,
             tile_v,
@@ -4204,6 +4272,7 @@ def gated_delta_rule_mtp(
                 is_varlen=False,
                 disable_state_update=disable_state_update,
                 cache_intermediate_states=cache_intermediate_states,
+                cache_stride=cache_stride,
                 stream=stream,
                 options="--enable-tvm-ffi",
             )
@@ -4240,6 +4309,7 @@ def gated_delta_rule_mtp(
             cache_steps,
             disable_state_update,
             cache_intermediate_states,
+            cache_stride,
             scale,
             use_qk_l2norm,
             tile_v,
@@ -4297,6 +4367,7 @@ def gated_delta_rule_mtp(
                 is_varlen=False,
                 disable_state_update=disable_state_update,
                 cache_intermediate_states=cache_intermediate_states,
+                cache_stride=cache_stride,
                 stream=stream,
                 options="--enable-tvm-ffi",
             )
@@ -4335,6 +4406,7 @@ def gated_delta_rule_mtp(
             cache_steps,
             disable_state_update,
             cache_intermediate_states,
+            cache_stride,
             scale,
             use_qk_l2norm,
             tile_v,
@@ -4396,6 +4468,7 @@ def gated_delta_rule_mtp(
                 is_varlen=False,
                 disable_state_update=disable_state_update,
                 cache_intermediate_states=cache_intermediate_states,
+                cache_stride=cache_stride,
                 ilp_rows=ilp_rows,
                 use_smem_v=use_smem_v,
                 stream=stream,
