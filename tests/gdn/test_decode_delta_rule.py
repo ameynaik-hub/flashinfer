@@ -539,6 +539,151 @@ def test_decode_kernel_pretranspose_pool(
 
 
 # ============================================================================
+# Test pretranspose kernel pool + indices with NON-CONTIGUOUS pool tensor
+# Verifies that a page-strided pool (non-contiguous on dim 0) produces
+# identical results to the gathered contiguous direct-state path.
+# ============================================================================
+
+
+def _test_decode_kernel_pretranspose_pool_noncontiguous(
+    dtype: str,
+    batch_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    scale: float,
+    page_gap: int = 2,
+    pool_multiplier: int = 3,
+    seed: int | None = None,
+):
+    """Non-contiguous pool must match gather → direct-state → scatter reference."""
+    _skip_if_not_sm90_or_later()
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_sab_heads = num_v_heads
+    pool_size = batch_size * pool_multiplier
+    dtype_torch = getattr(torch, dtype)
+    device = torch.device("cuda")
+
+    with device:
+        q = torch.randn(batch_size, 1, num_q_heads, head_size, dtype=dtype_torch)
+        k = torch.nn.functional.normalize(
+            torch.randn(batch_size, 1, num_k_heads, head_size, dtype=dtype_torch),
+            p=2.0,
+            dim=-1,
+        )
+        v = torch.randn(batch_size, 1, num_v_heads, head_size, dtype=dtype_torch)
+
+        A_log = torch.randn(num_sab_heads, dtype=torch.float32) * 0.1
+        dt_bias = torch.randn(num_sab_heads, dtype=torch.float32) * 0.1
+        a = torch.randn(batch_size, 1, num_sab_heads, dtype=dtype_torch) * 0.1
+        b = torch.randn(batch_size, 1, num_sab_heads, dtype=dtype_torch)
+
+        # Build non-contiguous [pool, HV, V, K] with page-stride gaps on dim-0.
+        pool_storage = torch.randn(
+            pool_size, page_gap, num_sab_heads, head_size, head_size,
+            dtype=torch.float32,
+        )
+        pool_source = pool_storage[:, page_gap - 1]  # stride[0] has gaps
+        assert not pool_source.is_contiguous(), "Expected non-contiguous pool view"
+        assert pool_source.stride(-1) == 1, "K-contiguous required"
+
+        indices = (
+            torch.arange(batch_size, dtype=torch.int32, device=device) * pool_multiplier
+        ) % pool_size
+
+    # ── Pool path (non-contiguous) ────────────────────────────────────────
+    pool_under_test_storage = pool_storage.clone()
+    pool_under_test = pool_under_test_storage[:, page_gap - 1]
+    out_pool, _ = gated_delta_rule_decode_pretranspose(
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=scale,
+        use_qk_l2norm=True,
+        initial_state=pool_under_test,
+        initial_state_indices=indices,
+    )
+    torch.cuda.synchronize()
+
+    # ── Direct-state reference (gathered contiguous) ──────────────────────
+    gathered_state = pool_source[indices].clone()
+    out_direct, updated_state = gated_delta_rule_decode_pretranspose(
+        q=q,
+        k=k,
+        v=v,
+        state=gathered_state,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        scale=scale,
+        use_qk_l2norm=True,
+    )
+    torch.cuda.synchronize()
+
+    atol = 5e-3
+    rtol = 5e-3
+
+    # Outputs must match
+    torch.testing.assert_close(out_pool, out_direct, atol=atol, rtol=rtol)
+
+    # Selected pool slots must match the state updated by the direct path
+    torch.testing.assert_close(
+        pool_under_test[indices], updated_state, atol=atol, rtol=rtol
+    )
+
+    # Non-selected pool slots must be exactly unchanged
+    mask = torch.ones(pool_size, dtype=torch.bool, device=device)
+    mask[indices] = False
+    torch.testing.assert_close(pool_under_test[mask], pool_source[mask], atol=0.0, rtol=0.0)
+
+    print(
+        f"✓ Non-contiguous pool pretranspose test passed "
+        f"(batch={batch_size}, pool={pool_size}, page_gap={page_gap})"
+    )
+
+
+@pytest.mark.parametrize("page_gap", [2, 3])
+@pytest.mark.parametrize("scale", [1.0])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(16, 16, 32)])
+@pytest.mark.parametrize("batch_size", [4, 16])
+@pytest.mark.parametrize("dtype", ["bfloat16"])
+def test_decode_kernel_pretranspose_pool_noncontiguous(
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    batch_size: int,
+    scale: float,
+    page_gap: int,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    _test_decode_kernel_pretranspose_pool_noncontiguous(
+        dtype,
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        scale,
+        page_gap=page_gap,
+        seed=seed,
+    )
+
+
+# ============================================================================
 # Test pretranspose kernel pool + indices with negative indices (padding)
 #
 # Negative pool indices signal padding slots: the kernel must write zeros to
