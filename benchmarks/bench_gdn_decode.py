@@ -1848,6 +1848,7 @@ def gdn_decode_bf16_state_wrapper(
     softplus_threshold: float = 20.0,
     intermediate_states_buffer=None,
     disable_state_update: bool = False,
+    disable_output: bool = False,
     initial_state_indices=None,
     output_state_indices=None,
 ):
@@ -1898,6 +1899,7 @@ def gdn_decode_bf16_state_wrapper(
             output_state_indices=output_state_indices,
             intermediate_states_buffer=intermediate_states_buffer,
             disable_state_update=disable_state_update,
+            disable_output=disable_output,
             use_qk_l2norm_in_kernel=use_qk_l2norm,
             scale=scale,
             output=output,
@@ -2250,6 +2252,7 @@ def bench_gdn_decode_bf16_state(
     use_qk_l2norm: bool = True,
     cache_intermediate_states: bool = False,
     disable_state_update: bool = False,
+    disable_output: bool = False,
     warmup_iters: int = 10,
     bench_iters: int = 100,
     pool_mode: str = "single",
@@ -2348,6 +2351,7 @@ def bench_gdn_decode_bf16_state(
             use_qk_l2norm,
             intermediate_states_buffer=intermediate_states_buffer,
             disable_state_update=disable_state_update,
+            disable_output=disable_output,
             initial_state_indices=initial_state_indices,
             output_state_indices=output_state_indices,
         ),
@@ -2402,6 +2406,7 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
 
     cache_intermediate = getattr(args, "cache_intermediate_states", False)
     disable_state_update = not getattr(args, "update_state", False)
+    disable_output = getattr(args, "no_output", False)
     pool_mode = getattr(args, "pool_mode", "single")
 
     print("\n" + "=" * 100)
@@ -2412,6 +2417,7 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
         f"dtype={args.dtype}, qk_l2norm={'ON' if use_qk_l2norm else 'OFF'}, "
         f"cache_intermediate={'ON' if cache_intermediate else 'OFF'}, "
         f"update_state={'ON' if not disable_state_update else 'OFF'}, "
+        f"output={'OFF' if disable_output else 'ON'}, "
         f"pool_mode={pool_mode}"
     )
     print("=" * 100)
@@ -2434,6 +2440,7 @@ def run_gdn_decode_bf16_state_benchmark(args, dtype, use_qk_l2norm):
                     use_qk_l2norm=use_qk_l2norm,
                     cache_intermediate_states=cache_intermediate,
                     disable_state_update=disable_state_update,
+                    disable_output=disable_output,
                     warmup_iters=args.warmup,
                     bench_iters=args.iters,
                     pool_mode=pool_mode,
@@ -2829,6 +2836,16 @@ Examples:
         "--update-state",
         action="store_true",
         help="Update final state (disable_state_update=False) for MTP benchmark",
+    )
+    parser.add_argument(
+        "--no-output",
+        action="store_true",
+        help=(
+            "Skip the per-token output projection (state-only mode). "
+            "Sets disable_output=True; the kernel still runs the recurrence "
+            "(state update) but skips the second inner product (h_new @ q), "
+            "the butterfly reduce of o, and the per-token output STG."
+        ),
     )
     parser.add_argument(
         "--pool-mode",

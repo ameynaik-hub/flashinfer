@@ -136,6 +136,7 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
+    disable_output: cutlass.Constexpr[bool],
 ):
     """MTP kernel (ILP=4) for BF16 state — higher occupancy at small batch.
 
@@ -237,45 +238,61 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
             for pass_idx in cutlass.range_constexpr(num_precompute_passes):
                 i_t_pre = pass_idx * num_groups + group_idx
                 if i_t_pre < T:
-                    q_tile_pre = cute.local_tile(
-                        q, (1, 1, 1, vec_size), (i_n, i_t_pre, i_h, lane_in_group)
-                    )
+                    # Q-side work is dead in state-only mode (disable_output=True):
+                    # Q is consumed only by `o = h_new @ q` per token, which is
+                    # gated off in the main loop. Skip Q LDG, F32 conv, l2norm
+                    # sum/butterfly/rsqrt, scale, and sQ STS — saves a token's
+                    # worth of LDG.E.128 + a butterfly per (i_t_pre, lane) pair.
+                    if cutlass.const_expr(not disable_output):
+                        q_tile_pre = cute.local_tile(
+                            q, (1, 1, 1, vec_size), (i_n, i_t_pre, i_h, lane_in_group)
+                        )
+                        cute.autovec_copy(q_tile_pre, r_q_bf16)
                     k_tile_pre = cute.local_tile(
                         k, (1, 1, 1, vec_size), (i_n, i_t_pre, i_h, lane_in_group)
                     )
-                    cute.autovec_copy(q_tile_pre, r_q_bf16)
                     cute.autovec_copy(k_tile_pre, r_k_bf16)
 
+                    if cutlass.const_expr(not disable_output):
+                        for i in cutlass.range_constexpr(vec_size):
+                            r_q[i] = cutlass.Float32(r_q_bf16[i])
                     for i in cutlass.range_constexpr(vec_size):
-                        r_q[i] = cutlass.Float32(r_q_bf16[i])
                         r_k[i] = cutlass.Float32(r_k_bf16[i])
 
                     if cutlass.const_expr(use_qk_l2norm):
-                        sum_q = 0.0
-                        sum_k = 0.0
+                        sum_k = cutlass.Float32(0.0)
                         for i in cutlass.range_constexpr(vec_size):
-                            sum_q += r_q[i] * r_q[i]
                             sum_k += r_k[i] * r_k[i]
                         for offset in [16, 8, 4, 2, 1]:
-                            sum_q += cute.arch.shuffle_sync_bfly(
-                                sum_q, offset=offset, mask=-1, mask_and_clamp=31
-                            )
                             sum_k += cute.arch.shuffle_sync_bfly(
                                 sum_k, offset=offset, mask=-1, mask_and_clamp=31
                             )
-                        inv_norm_q_scaled = (
-                            cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
-                        )
                         inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
                         for i in cutlass.range_constexpr(vec_size):
-                            r_q[i] = r_q[i] * inv_norm_q_scaled
                             r_k[i] = r_k[i] * inv_norm_k
-                    else:
+
+                        if cutlass.const_expr(not disable_output):
+                            sum_q = cutlass.Float32(0.0)
+                            for i in cutlass.range_constexpr(vec_size):
+                                sum_q += r_q[i] * r_q[i]
+                            for offset in [16, 8, 4, 2, 1]:
+                                sum_q += cute.arch.shuffle_sync_bfly(
+                                    sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                            inv_norm_q_scaled = (
+                                cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
+                            )
+                            for i in cutlass.range_constexpr(vec_size):
+                                r_q[i] = r_q[i] * inv_norm_q_scaled
+                    elif cutlass.const_expr(not disable_output):
+                        # Only Q is scaled when no l2norm; K is identity.
                         for i in cutlass.range_constexpr(vec_size):
                             r_q[i] = r_q[i] * scale
 
+                    if cutlass.const_expr(not disable_output):
+                        for i in cutlass.range_constexpr(vec_size):
+                            sQ[(i_t_pre, k_start + i)] = r_q[i]
                     for i in cutlass.range_constexpr(vec_size):
-                        sQ[(i_t_pre, k_start + i)] = r_q[i]
                         sK[(i_t_pre, k_start + i)] = r_k[i]
 
                     if cutlass.const_expr(T > 2):
@@ -598,44 +615,46 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         r_h[3, i], r_h[3, i + 1] = fma_pair(
                             r_k[i], r_k[i + 1], vnd, vnd, r_h[3, i], r_h[3, i + 1]
                         )
-                    if cutlass.const_expr(use_packed_fma):
-                        oa, oa2 = cute.arch.fma_packed_f32x2(
-                            src_a=(r_h[0, i], r_h[0, i + 1]),
-                            src_b=(r_q[i], r_q[i + 1]),
-                            src_c=(oa, oa2),
-                        )
-                        ob, ob2 = cute.arch.fma_packed_f32x2(
-                            src_a=(r_h[1, i], r_h[1, i + 1]),
-                            src_b=(r_q[i], r_q[i + 1]),
-                            src_c=(ob, ob2),
-                        )
-                        oc, oc2 = cute.arch.fma_packed_f32x2(
-                            src_a=(r_h[2, i], r_h[2, i + 1]),
-                            src_b=(r_q[i], r_q[i + 1]),
-                            src_c=(oc, oc2),
-                        )
-                        od, od2 = cute.arch.fma_packed_f32x2(
-                            src_a=(r_h[3, i], r_h[3, i + 1]),
-                            src_b=(r_q[i], r_q[i + 1]),
-                            src_c=(od, od2),
-                        )
-                    else:
-                        oa, oa2 = fma_pair(
-                            r_h[0, i], r_h[0, i + 1], r_q[i], r_q[i + 1], oa, oa2
-                        )
-                        ob, ob2 = fma_pair(
-                            r_h[1, i], r_h[1, i + 1], r_q[i], r_q[i + 1], ob, ob2
-                        )
-                        oc, oc2 = fma_pair(
-                            r_h[2, i], r_h[2, i + 1], r_q[i], r_q[i + 1], oc, oc2
-                        )
-                        od, od2 = fma_pair(
-                            r_h[3, i], r_h[3, i + 1], r_q[i], r_q[i + 1], od, od2
-                        )
-                oa = oa + oa2
-                ob = ob + ob2
-                oc = oc + oc2
-                od = od + od2
+                    if cutlass.const_expr(not disable_output):
+                        if cutlass.const_expr(use_packed_fma):
+                            oa, oa2 = cute.arch.fma_packed_f32x2(
+                                src_a=(r_h[0, i], r_h[0, i + 1]),
+                                src_b=(r_q[i], r_q[i + 1]),
+                                src_c=(oa, oa2),
+                            )
+                            ob, ob2 = cute.arch.fma_packed_f32x2(
+                                src_a=(r_h[1, i], r_h[1, i + 1]),
+                                src_b=(r_q[i], r_q[i + 1]),
+                                src_c=(ob, ob2),
+                            )
+                            oc, oc2 = cute.arch.fma_packed_f32x2(
+                                src_a=(r_h[2, i], r_h[2, i + 1]),
+                                src_b=(r_q[i], r_q[i + 1]),
+                                src_c=(oc, oc2),
+                            )
+                            od, od2 = cute.arch.fma_packed_f32x2(
+                                src_a=(r_h[3, i], r_h[3, i + 1]),
+                                src_b=(r_q[i], r_q[i + 1]),
+                                src_c=(od, od2),
+                            )
+                        else:
+                            oa, oa2 = fma_pair(
+                                r_h[0, i], r_h[0, i + 1], r_q[i], r_q[i + 1], oa, oa2
+                            )
+                            ob, ob2 = fma_pair(
+                                r_h[1, i], r_h[1, i + 1], r_q[i], r_q[i + 1], ob, ob2
+                            )
+                            oc, oc2 = fma_pair(
+                                r_h[2, i], r_h[2, i + 1], r_q[i], r_q[i + 1], oc, oc2
+                            )
+                            od, od2 = fma_pair(
+                                r_h[3, i], r_h[3, i + 1], r_q[i], r_q[i + 1], od, od2
+                            )
+                if cutlass.const_expr(not disable_output):
+                    oa = oa + oa2
+                    ob = ob + ob2
+                    oc = oc + oc2
+                    od = od + od2
 
                 if cutlass.const_expr(cache_intermediate_states):
                     for i in cutlass.range_constexpr(vec_size):
@@ -678,31 +697,32 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                     cute.autovec_copy(r_hb4_2, itc)
                     cute.autovec_copy(r_hb4_3, itd)
 
-                for offset in [16, 8, 4, 2, 1]:
-                    oa += cute.arch.shuffle_sync_bfly(
-                        oa, offset=offset, mask=-1, mask_and_clamp=31
-                    )
-                    ob += cute.arch.shuffle_sync_bfly(
-                        ob, offset=offset, mask=-1, mask_and_clamp=31
-                    )
-                    oc += cute.arch.shuffle_sync_bfly(
-                        oc, offset=offset, mask=-1, mask_and_clamp=31
-                    )
-                    od += cute.arch.shuffle_sync_bfly(
-                        od, offset=offset, mask=-1, mask_and_clamp=31
-                    )
+                if cutlass.const_expr(not disable_output):
+                    for offset in [16, 8, 4, 2, 1]:
+                        oa += cute.arch.shuffle_sync_bfly(
+                            oa, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        ob += cute.arch.shuffle_sync_bfly(
+                            ob, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        oc += cute.arch.shuffle_sync_bfly(
+                            oc, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        od += cute.arch.shuffle_sync_bfly(
+                            od, offset=offset, mask=-1, mask_and_clamp=31
+                        )
 
-                if lane_in_group == 0:
-                    r_o4_bf16[0] = cutlass.BFloat16(oa)
-                    r_o4_bf16[1] = cutlass.BFloat16(ob)
-                    r_o4_bf16[2] = cutlass.BFloat16(oc)
-                    r_o4_bf16[3] = cutlass.BFloat16(od)
-                    ot4_slice = cute.local_tile(
-                        o,
-                        (1, 1, 1, ILP4),
-                        (i_n, i_t, i_hv, vb4 // ILP4),
-                    )
-                    cute.autovec_copy(r_o4_bf16, ot4_slice)
+                    if lane_in_group == 0:
+                        r_o4_bf16[0] = cutlass.BFloat16(oa)
+                        r_o4_bf16[1] = cutlass.BFloat16(ob)
+                        r_o4_bf16[2] = cutlass.BFloat16(oc)
+                        r_o4_bf16[3] = cutlass.BFloat16(od)
+                        ot4_slice = cute.local_tile(
+                            o,
+                            (1, 1, 1, ILP4),
+                            (i_n, i_t, i_hv, vb4 // ILP4),
+                        )
+                        cute.autovec_copy(r_o4_bf16, ot4_slice)
 
             if cutlass.const_expr(not disable_state_update):
                 if cutlass.const_expr(not cache_intermediate_states):
@@ -755,6 +775,7 @@ def gdn_wide_vec_kernel(
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
+    disable_output: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     lane_in_warp = tidx % 32
@@ -794,7 +815,7 @@ def gdn_wide_vec_kernel(
         cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
     )
     sGB = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((T, 3), stride=(3, 1)), 16
+        cutlass.Float32, cute.make_layout((T, 2), stride=(2, 1)), 16
     )
 
     # ----- registers -----
@@ -822,6 +843,15 @@ def gdn_wide_vec_kernel(
     r_hb3 = cute.make_rmem_tensor(
         cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
     )
+    # Per-token output BF16 register (4 elements = ILP_ROWS, packed into a
+    # single STG via autovec_copy — replaces 4 scalar STGs that were issued
+    # by lane_in_group==0 per token, halving o-write LSU traffic.)
+    # Gated under `not disable_output` so state-only mode doesn't pay
+    # register pressure for an unused tensor.
+    if cutlass.const_expr(not disable_output):
+        r_o4_bf16 = cute.make_rmem_tensor(
+            cute.make_layout((ILP_ROWS,), stride=(1,)), cutlass.BFloat16
+        )
 
     if cache_idx < 0:
         cache_idx = cutlass.Int32(0)
@@ -864,56 +894,67 @@ def gdn_wide_vec_kernel(
         for pass_idx in cutlass.range_constexpr(num_precompute_passes):
             i_t_pre = pass_idx * NUM_WARPS + warp_idx
             if i_t_pre < T:
-                q_tile_pre = cute.local_tile(
-                    q, (1, 1, 1, vec), (i_n, i_t_pre, i_h, member_pre)
-                )
+                # Q-side work is dead in state-only mode (disable_output=True).
+                # In wide_vec the kq_partial path also writes to sGB[..., 2] but
+                # is never read by the main loop — gated off too (dead in all
+                # modes; the gate just makes the elision explicit instead of
+                # relying on the compiler).
+                if cutlass.const_expr(not disable_output):
+                    q_tile_pre = cute.local_tile(
+                        q, (1, 1, 1, vec), (i_n, i_t_pre, i_h, member_pre)
+                    )
+                    cute.autovec_copy(q_tile_pre, r_q_bf16)
                 k_tile_pre = cute.local_tile(
                     k, (1, 1, 1, vec), (i_n, i_t_pre, i_h, member_pre)
                 )
-                cute.autovec_copy(q_tile_pre, r_q_bf16)
                 cute.autovec_copy(k_tile_pre, r_k_bf16)
+                if cutlass.const_expr(not disable_output):
+                    for i in cutlass.range_constexpr(vec):
+                        r_q[i] = cutlass.Float32(r_q_bf16[i])
                 for i in cutlass.range_constexpr(vec):
-                    r_q[i] = cutlass.Float32(r_q_bf16[i])
                     r_k[i] = cutlass.Float32(r_k_bf16[i])
 
                 if cutlass.const_expr(use_qk_l2norm):
-                    sum_q = cutlass.Float32(0.0)
                     sum_k = cutlass.Float32(0.0)
                     for i in cutlass.range_constexpr(vec):
-                        sum_q += r_q[i] * r_q[i]
                         sum_k += r_k[i] * r_k[i]
                     # 4-stage butterfly within 16-thread subgroup
                     for offset in [8, 4, 2, 1]:
-                        sum_q += cute.arch.shuffle_sync_bfly(
-                            sum_q, offset=offset, mask=-1, mask_and_clamp=31
-                        )
                         sum_k += cute.arch.shuffle_sync_bfly(
                             sum_k, offset=offset, mask=-1, mask_and_clamp=31
                         )
-                    inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
                     inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
                     for i in cutlass.range_constexpr(vec):
-                        r_q[i] = r_q[i] * inv_norm_q_scaled
                         r_k[i] = r_k[i] * inv_norm_k
-                else:
+
+                    if cutlass.const_expr(not disable_output):
+                        sum_q = cutlass.Float32(0.0)
+                        for i in cutlass.range_constexpr(vec):
+                            sum_q += r_q[i] * r_q[i]
+                        for offset in [8, 4, 2, 1]:
+                            sum_q += cute.arch.shuffle_sync_bfly(
+                                sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                        inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
+                        for i in cutlass.range_constexpr(vec):
+                            r_q[i] = r_q[i] * inv_norm_q_scaled
+                elif cutlass.const_expr(not disable_output):
                     for i in cutlass.range_constexpr(vec):
                         r_q[i] = r_q[i] * scale
 
                 # Write q, k to SMEM (both 16-thread subgroups write same data)
+                if cutlass.const_expr(not disable_output):
+                    for i in cutlass.range_constexpr(vec):
+                        sQ[(i_t_pre, k_start_pre + i)] = r_q[i]
                 for i in cutlass.range_constexpr(vec):
-                    sQ[(i_t_pre, k_start_pre + i)] = r_q[i]
                     sK[(i_t_pre, k_start_pre + i)] = r_k[i]
 
-                # kq partial and reduce within 16-thread subgroup
-                kq_partial = cutlass.Float32(0.0)
-                for i in cutlass.range_constexpr(vec):
-                    kq_partial += r_k[i] * r_q[i]
-                for offset in [8, 4, 2, 1]:
-                    kq_partial += cute.arch.shuffle_sync_bfly(
-                        kq_partial, offset=offset, mask=-1, mask_and_clamp=31
-                    )
+                # NOTE: a kq_partial reduction used to live here and write to
+                # sGB[(i_t_pre, 2)]. The main loop never reads slot 2, so it
+                # was pure dead code — removed to save 4 packed FMAs + 4
+                # shuffles per warp per token in stateless and update modes.
 
-                # g, beta, kq to sGB (lane 0 of warp writes)
+                # g, beta to sGB (lane 0 of warp writes)
                 r_a_pre = cutlass.Float32(a[i_n, i_t_pre, i_hv])
                 r_b_pre = cutlass.Float32(b_gate[i_n, i_t_pre, i_hv])
                 x_pre = r_a_pre + r_dt_bias
@@ -941,7 +982,6 @@ def gdn_wide_vec_kernel(
                 if lane_in_warp == 0:
                     sGB[(i_t_pre, 0)] = r_g_pre
                     sGB[(i_t_pre, 1)] = r_beta_pre
-                    sGB[(i_t_pre, 2)] = kq_partial
 
             cute.arch.barrier()
 
@@ -1083,14 +1123,18 @@ def gdn_wide_vec_kernel(
                 vn2 = (v_val2 - s2) * r_beta
                 vn3 = (v_val3 - s3) * r_beta
 
-                # Rank-1 update + h @ q (in one K-loop)
+                # Rank-1 update of r_h; optionally fused with h_new @ q output.
+                # When disable_output=True (state-only mode, e.g. prefill cache
+                # warmup), skip the o accumulation, butterfly reduce, and
+                # writeback — saving the second inner product per token.
                 o0 = cutlass.Float32(0.0)
                 o1 = cutlass.Float32(0.0)
                 o2 = cutlass.Float32(0.0)
                 o3 = cutlass.Float32(0.0)
                 for i in cutlass.range_constexpr(0, vec, 2):
-                    qv0 = sQ[(i_t, k_start + i)]
-                    qv1 = sQ[(i_t, k_start + i + 1)]
+                    if cutlass.const_expr(not disable_output):
+                        qv0 = sQ[(i_t, k_start + i)]
+                        qv1 = sQ[(i_t, k_start + i + 1)]
                     kv0 = sK[(i_t, k_start + i)]
                     kv1 = sK[(i_t, k_start + i + 1)]
                     if cutlass.const_expr(use_packed_fma):
@@ -1127,33 +1171,43 @@ def gdn_wide_vec_kernel(
                         r_h[3, i], r_h[3, i + 1] = fma_pair(
                             kv0, kv1, vn3, vn3, r_h[3, i], r_h[3, i + 1]
                         )
-                    # h_new @ q with updated r_h
-                    o0 = o0 + r_h[0, i] * qv0 + r_h[0, i + 1] * qv1
-                    o1 = o1 + r_h[1, i] * qv0 + r_h[1, i + 1] * qv1
-                    o2 = o2 + r_h[2, i] * qv0 + r_h[2, i + 1] * qv1
-                    o3 = o3 + r_h[3, i] * qv0 + r_h[3, i + 1] * qv1
+                    if cutlass.const_expr(not disable_output):
+                        # h_new @ q with updated r_h
+                        o0 = o0 + r_h[0, i] * qv0 + r_h[0, i + 1] * qv1
+                        o1 = o1 + r_h[1, i] * qv0 + r_h[1, i + 1] * qv1
+                        o2 = o2 + r_h[2, i] * qv0 + r_h[2, i + 1] * qv1
+                        o3 = o3 + r_h[3, i] * qv0 + r_h[3, i + 1] * qv1
 
-                # Butterfly reduce o
-                for offset in [8, 4, 2, 1]:
-                    o0 += cute.arch.shuffle_sync_bfly(
-                        o0, offset=offset, mask=-1, mask_and_clamp=31
-                    )
-                    o1 += cute.arch.shuffle_sync_bfly(
-                        o1, offset=offset, mask=-1, mask_and_clamp=31
-                    )
-                    o2 += cute.arch.shuffle_sync_bfly(
-                        o2, offset=offset, mask=-1, mask_and_clamp=31
-                    )
-                    o3 += cute.arch.shuffle_sync_bfly(
-                        o3, offset=offset, mask=-1, mask_and_clamp=31
-                    )
+                if cutlass.const_expr(not disable_output):
+                    # Butterfly reduce o
+                    for offset in [8, 4, 2, 1]:
+                        o0 += cute.arch.shuffle_sync_bfly(
+                            o0, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        o1 += cute.arch.shuffle_sync_bfly(
+                            o1, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        o2 += cute.arch.shuffle_sync_bfly(
+                            o2, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        o3 += cute.arch.shuffle_sync_bfly(
+                            o3, offset=offset, mask=-1, mask_and_clamp=31
+                        )
 
-                # Output scalar write (lane_in_group==0 only)
-                if lane_in_group == 0:
-                    o[(i_n, i_t, i_hv, v0)] = cutlass.BFloat16(o0)
-                    o[(i_n, i_t, i_hv, v1)] = cutlass.BFloat16(o1)
-                    o[(i_n, i_t, i_hv, v2)] = cutlass.BFloat16(o2)
-                    o[(i_n, i_t, i_hv, v3)] = cutlass.BFloat16(o3)
+                    # Output 4-element packed write (lane_in_group==0 only).
+                    # Single autovec_copy STG instead of 4 scalar BF16 stores;
+                    # v0..v3 are 4 contiguous V indices (v_base..v_base+3).
+                    if lane_in_group == 0:
+                        r_o4_bf16[0] = cutlass.BFloat16(o0)
+                        r_o4_bf16[1] = cutlass.BFloat16(o1)
+                        r_o4_bf16[2] = cutlass.BFloat16(o2)
+                        r_o4_bf16[3] = cutlass.BFloat16(o3)
+                        o_slice = cute.local_tile(
+                            o,
+                            (1, 1, 1, ILP_ROWS),
+                            (i_n, i_t, i_hv, v_base // ILP_ROWS),
+                        )
+                        cute.autovec_copy(r_o4_bf16, o_slice)
 
                 # Intermediate write (for every token when caching)
                 if cutlass.const_expr(cache_intermediate_states):
@@ -1245,6 +1299,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
+    disable_output: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Launch the MTP kernel (ILP=4) for BF16 state."""
@@ -1293,6 +1348,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         cache_intermediate_states,
         use_packed_fma,
         same_pool,
+        disable_output,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[MTP_NUM_THREADS, 1, 1],
@@ -1335,6 +1391,7 @@ def _run_wide_vec(
     cache_intermediate_states: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     same_pool: cutlass.Constexpr[bool],
+    disable_output: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     num_v_tiles: cutlass.Constexpr[int] = V // tile_v
@@ -1342,7 +1399,7 @@ def _run_wide_vec(
     smem_bytes = (
         4 * T * (K + 8)  # sQ FP32
         + 4 * T * (K + 8)  # sK FP32
-        + 4 * T * 3  # sGB
+        + 4 * T * 2  # sGB (g, beta — kq_partial slot dropped, was dead)
         + 256
     )
     gdn_wide_vec_kernel(
@@ -1374,6 +1431,7 @@ def _run_wide_vec(
         cache_intermediate_states,
         use_packed_fma,
         same_pool,
+        disable_output,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS, 1, 1],
@@ -1628,6 +1686,7 @@ def gated_delta_rule_mtp_wide_vec(
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
     tile_v: int = 128,
+    disable_output: bool = False,
 ) -> torch.Tensor:
     """Wide-vector BF16 GDN MTP decode.
 
@@ -1720,6 +1779,7 @@ def gated_delta_rule_mtp_wide_vec(
         softplus_threshold,
         use_packed_fma,
         same_pool,
+        disable_output,
     )
     if cache_key not in _compiled_kernels_wide_vec:
         default_indices = torch.arange(B_val, dtype=torch.int32, device=q.device)
@@ -1782,6 +1842,7 @@ def gated_delta_rule_mtp_wide_vec(
                 cache_intermediate_states,
                 use_packed_fma,
                 same_pool,
+                disable_output,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
@@ -1835,6 +1896,7 @@ def gated_delta_rule_mtp(
     use_qk_l2norm_in_kernel: bool = True,
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
+    disable_output: bool = False,
 ) -> torch.Tensor:
     """
     GDN MTP (Multiple Token Processing) with BF16 state.
@@ -1944,6 +2006,7 @@ def gated_delta_rule_mtp(
             scale=scale,
             output=output,
             tile_v=wv_tile_v,
+            disable_output=disable_output,
         )
 
     # Wide_vec didn't fire (work_units < 128 at T>=2, or T=1 small batch
@@ -1979,6 +2042,7 @@ def gated_delta_rule_mtp(
         softplus_threshold,
         use_packed_fma,
         same_pool,
+        disable_output,
     )
     if cache_key not in _compiled_kernels_mtp:
         # First call for this shape: allocate default indices/output and do
@@ -2034,6 +2098,7 @@ def gated_delta_rule_mtp(
                 cache_intermediate_states,
                 use_packed_fma,
                 same_pool,
+                disable_output,
                 stream,
                 options="--enable-tvm-ffi --generate-line-info --opt-level 3",
             ),
