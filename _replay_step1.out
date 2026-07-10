@@ -1,0 +1,109 @@
+GPU: NVIDIA B200  H=16 HV=64 K=V=128
+
+[test-mild B=1] torch reference sweeps (fp32 + bf16)...
+       regime    B   T   h |     seq16     2call    branch    REPLAY |  rp-vs-2c  nan
+    test-mild    1   4   0 |  1.94e-04  6.60e-04  4.75e-04  6.60e-04 |  0.00e+00    0 (bit==2call)
+    test-mild    1   4   4 |  7.95e-05  2.40e-04  1.31e-04  2.56e-04 |  1.22e-04    0
+    test-mild    1   4   8 |  4.70e-05  2.43e-04  1.06e-04  2.55e-04 |  1.22e-04    0
+    test-mild    1   4  12 |  5.03e-05  3.04e-04  1.13e-04  2.95e-04 |  2.44e-04    0
+    test-mild    1   8   0 |  1.94e-04  6.60e-04  4.75e-04  6.60e-04 |  0.00e+00    0 (bit==2call)
+    test-mild    1   8   4 |  7.95e-05  2.43e-04  1.31e-04  2.56e-04 |  1.22e-04    0
+    test-mild    1   8   8 |  5.03e-05  2.95e-04  1.13e-04  2.95e-04 |  1.22e-04    0
+    test-mild    1  16   0 |  1.94e-04  6.60e-04  4.75e-04  6.60e-04 |  0.00e+00    0 (bit==2call)
+
+[test-mild B=16] torch reference sweeps (fp32 + bf16)...
+       regime    B   T   h |     seq16     2call    branch    REPLAY |  rp-vs-2c  nan
+    test-mild   16   4   0 |  2.08e-04  7.60e-04  4.88e-04  7.60e-04 |  0.00e+00    0 (bit==2call)
+    test-mild   16   4   4 |  8.87e-05  3.39e-04  1.37e-04  3.39e-04 |  2.44e-04    0
+    test-mild   16   4   8 |  5.52e-05  3.67e-04  1.31e-04  3.67e-04 |  2.44e-04    0
+    test-mild   16   4  12 |  5.69e-05  3.80e-04  2.37e-04  3.80e-04 |  2.44e-04    0
+    test-mild   16   8   0 |  2.08e-04  7.60e-04  4.88e-04  7.60e-04 |  0.00e+00    0 (bit==2call)
+    test-mild   16   8   4 |  8.87e-05  3.67e-04  1.37e-04  3.67e-04 |  2.44e-04    0
+    test-mild   16   8   8 |  5.69e-05  3.80e-04  2.37e-04  3.80e-04 |  2.44e-04    0
+    test-mild   16  16   0 |  2.08e-04  7.60e-04  4.88e-04  7.60e-04 |  0.00e+00    0 (bit==2call)
+
+[test-mild B=256] torch reference sweeps (fp32 + bf16)...
+       regime    B   T   h |     seq16     2call    branch    REPLAY |  rp-vs-2c  nan
+    test-mild  256   4   0 |  2.29e-04  9.50e-04  4.88e-04  9.50e-04 |  0.00e+00    0 (bit==2call)
+    test-mild  256   4   4 |  9.45e-05  5.03e-04  2.37e-04  5.03e-04 |  3.66e-04    0
+    test-mild  256   4   8 |  6.96e-05  5.39e-04  2.43e-04  5.39e-04 |  2.44e-04    0
+    test-mild  256   4  12 |  7.54e-05  5.64e-04  2.42e-04  5.64e-04 |  4.88e-04    0
+    test-mild  256   8   0 |  2.29e-04  9.50e-04  4.88e-04  9.50e-04 |  0.00e+00    0 (bit==2call)
+    test-mild  256   8   4 |  9.45e-05  5.39e-04  2.43e-04  5.39e-04 |  3.66e-04    0
+    test-mild  256   8   8 |  7.54e-05  5.64e-04  2.43e-04  5.64e-04 |  2.44e-04    0
+    test-mild  256  16   0 |  2.29e-04  9.50e-04  4.88e-04  9.50e-04 |  0.00e+00    0 (bit==2call)
+
+[strong-decay B=1] torch reference sweeps (fp32 + bf16)...
+       regime    B   T   h |     seq16     2call    branch    REPLAY |  rp-vs-2c  nan
+ strong-decay    1   4   0 |  8.60e-04  9.88e-04  8.70e-04  9.88e-04 |  0.00e+00    0 (bit==2call)
+ strong-decay    1   4   4 |  1.11e-03  1.14e-03  1.03e-03  9.95e-04 |  1.04e-03    0
+ strong-decay    1   4   8 |  1.41e-03  1.32e-03  1.22e-03  7.05e-04 |  1.40e-03    0
+ strong-decay    1   4  12 |  1.28e-03  1.53e-03  1.53e-03  1.08e-03 |  1.46e-03    0
+ strong-decay    1   8   0 |  1.11e-03  9.95e-04  8.70e-04  9.95e-04 |  0.00e+00    0 (bit==2call)
+ strong-decay    1   8   4 |  1.41e-03  1.14e-03  1.03e-03  9.95e-04 |  1.04e-03    0
+ strong-decay    1   8   8 |  1.41e-03  1.36e-03  1.22e-03  1.08e-03 |  1.40e-03    0
+ strong-decay    1  16   0 |  1.41e-03  1.08e-03  8.70e-04  1.08e-03 |  0.00e+00    0 (bit==2call)
+
+[strong-decay B=16] torch reference sweeps (fp32 + bf16)...
+       regime    B   T   h |     seq16     2call    branch    REPLAY |  rp-vs-2c  nan
+ strong-decay   16   4   0 |  9.05e-04  1.43e-03  9.76e-04  1.43e-03 |  0.00e+00    0 (bit==2call)
+ strong-decay   16   4   4 |  1.09e-03  1.31e-03  1.17e-03  1.23e-03 |  1.22e-03    0
+ strong-decay   16   4   8 |  1.02e-03  1.24e-03  1.04e-03  1.01e-03 |  1.10e-03    0
+ strong-decay   16   4  12 |  1.12e-03  1.41e-03  1.16e-03  9.35e-04 |  1.46e-03    0
+ strong-decay   16   8   0 |  1.09e-03  1.43e-03  9.76e-04  1.43e-03 |  0.00e+00    0 (bit==2call)
+ strong-decay   16   8   4 |  1.09e-03  1.31e-03  1.17e-03  1.23e-03 |  1.22e-03    0
+ strong-decay   16   8   8 |  1.12e-03  1.33e-03  1.08e-03  1.01e-03 |  1.10e-03    0
+ strong-decay   16  16   0 |  1.12e-03  1.43e-03  9.76e-04  1.43e-03 |  0.00e+00    0 (bit==2call)
+
+[strong-decay B=256] torch reference sweeps (fp32 + bf16)...
+       regime    B   T   h |     seq16     2call    branch    REPLAY |  rp-vs-2c  nan
+ strong-decay  256   4   0 |  8.70e-04  1.59e-03  9.76e-04  1.59e-03 |  0.00e+00    0 (bit==2call)
+ strong-decay  256   4   4 |  1.17e-03  1.47e-03  1.32e-03  1.23e-03 |  1.95e-03    0
+ strong-decay  256   4   8 |  1.13e-03  1.49e-03  1.05e-03  1.01e-03 |  1.46e-03    0
+ strong-decay  256   4  12 |  1.23e-03  1.61e-03  1.14e-03  8.27e-04 |  1.34e-03    0
+ strong-decay  256   8   0 |  1.17e-03  1.59e-03  9.76e-04  1.59e-03 |  0.00e+00    0 (bit==2call)
+ strong-decay  256   8   4 |  1.17e-03  1.47e-03  1.32e-03  1.23e-03 |  1.95e-03    0
+ strong-decay  256   8   8 |  1.23e-03  1.49e-03  1.12e-03  1.01e-03 |  1.46e-03    0
+ strong-decay  256  16   0 |  1.23e-03  1.59e-03  9.76e-04  1.59e-03 |  0.00e+00    0 (bit==2call)
+
+[big-state B=1] torch reference sweeps (fp32 + bf16)...
+       regime    B   T   h |     seq16     2call    branch    REPLAY |  rp-vs-2c  nan
+    big-state    1   4   0 |  5.15e-03  1.90e-02  1.45e-02  1.90e-02 |  0.00e+00    0 (bit==2call)
+    big-state    1   4   4 |  1.91e-03  2.36e-03  2.25e-03  2.36e-03 |  2.93e-03    0
+    big-state    1   4   8 |  5.71e-04  6.18e-04  6.18e-04  4.44e-04 |  7.32e-04    0
+    big-state    1   4  12 |  1.17e-04  4.18e-04  1.14e-04  4.18e-04 |  2.44e-04    0
+    big-state    1   8   0 |  5.15e-03  1.90e-02  1.45e-02  1.90e-02 |  0.00e+00    0 (bit==2call)
+    big-state    1   8   4 |  1.91e-03  2.36e-03  2.25e-03  2.36e-03 |  2.93e-03    0
+    big-state    1   8   8 |  5.71e-04  6.18e-04  6.18e-04  4.44e-04 |  7.32e-04    0
+    big-state    1  16   0 |  5.15e-03  1.90e-02  1.45e-02  1.90e-02 |  0.00e+00    0 (bit==2call)
+
+[big-state B=16] torch reference sweeps (fp32 + bf16)...
+       regime    B   T   h |     seq16     2call    branch    REPLAY |  rp-vs-2c  nan
+    big-state   16   4   0 |  6.20e-03  2.30e-02  1.56e-02  2.30e-02 |  0.00e+00    0 (bit==2call)
+    big-state   16   4   4 |  2.63e-03  3.11e-03  2.63e-03  3.19e-03 |  4.88e-03    0
+    big-state   16   4   8 |  4.26e-04  6.15e-04  4.45e-04  3.70e-04 |  5.49e-04    0
+    big-state   16   4  12 |  7.74e-05  3.97e-04  1.24e-04  3.97e-04 |  2.44e-04    0
+    big-state   16   8   0 |  6.20e-03  2.30e-02  1.56e-02  2.30e-02 |  0.00e+00    0 (bit==2call)
+    big-state   16   8   4 |  2.63e-03  3.11e-03  2.63e-03  3.19e-03 |  4.88e-03    0
+    big-state   16   8   8 |  4.26e-04  6.15e-04  4.45e-04  3.97e-04 |  5.49e-04    0
+    big-state   16  16   0 |  6.20e-03  2.30e-02  1.56e-02  2.30e-02 |  0.00e+00    0 (bit==2call)
+
+[big-state B=256] torch reference sweeps (fp32 + bf16)...
+       regime    B   T   h |     seq16     2call    branch    REPLAY |  rp-vs-2c  nan
+    big-state  256   4   0 |  6.84e-03  2.60e-02  1.56e-02  2.60e-02 |  0.00e+00    0 (bit==2call)
+    big-state  256   4   4 |  2.55e-03  3.62e-03  3.24e-03  3.17e-03 |  3.91e-03    0
+    big-state  256   4   8 |  4.34e-04  7.03e-04  4.35e-04  7.03e-04 |  5.49e-04    0
+    big-state  256   4  12 |  7.62e-05  4.68e-04  2.43e-04  4.68e-04 |  2.44e-04    0
+    big-state  256   8   0 |  6.84e-03  2.60e-02  1.56e-02  2.60e-02 |  0.00e+00    0 (bit==2call)
+    big-state  256   8   4 |  2.55e-03  3.62e-03  3.24e-03  3.17e-03 |  3.91e-03    0
+    big-state  256   8   8 |  4.34e-04  7.03e-04  4.35e-04  7.03e-04 |  5.49e-04    0
+    big-state  256  16   0 |  6.84e-03  2.60e-02  1.56e-02  2.60e-02 |  0.00e+00    0 (bit==2call)
+
+NaN probe (zeroed hist q, B=16, T=4, h=8, strong-decay): hist rows nan/inf=0 (discarded anyway), draft rows nan/inf=0  (no leak)
+
+Packing cost (copy T draft rows into persistent 16-row buffers):
+  B=   1  T=4 rows -> eager    35.78 us | graphed     9.76 us (median)
+  B=  16  T=4 rows -> eager    37.66 us | graphed    14.75 us (median)
+  B= 256  T=4 rows -> eager    39.30 us | graphed    32.90 us (median)
+
+ALL PASS
