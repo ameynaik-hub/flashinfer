@@ -2257,18 +2257,25 @@ class GdnFlushKernel:
         _sH_int_p5 = sH.iterator.toint()
         for _eh in cutlass.range_constexpr(2):
             sync_threads()  # all lanes past the previous sH contents
-            if warp_id == 0:
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        mbar_h_ptr,
-                        V_DIM_C * K_HALF * 2,
-                    )
-                if _eh == 0:
-                    cute.copy(tma_atom_h, tHgH0, tHsH0, tma_bar_ptr=mbar_h_ptr)
-                else:
-                    cute.copy(tma_atom_h, tHgH1, tHsH1, tma_bar_ptr=mbar_h_ptr)
-            cute.arch.mbarrier_wait(mbar_h_ptr, 0 if _eh == 0 else 1)
-            cute.arch.fence_view_async_shared()
+            # v1.5: the H0 re-read is the only per-CTA Phase-5 memory cost that
+            # scales with the batch flush rate — predicate it (and its wait) on
+            # p_val > 0. The branch is CTA-uniform (p_val is a per-request
+            # scalar), so the barrier accounting stays consistent per CTA; the
+            # MMA/LDS math below still runs unconditionally on stale sH for
+            # P=0 CTAs (harmless — their stores are predicated off).
+            if p_val > Int32(0):
+                if warp_id == 0:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            mbar_h_ptr,
+                            V_DIM_C * K_HALF * 2,
+                        )
+                    if _eh == 0:
+                        cute.copy(tma_atom_h, tHgH0, tHsH0, tma_bar_ptr=mbar_h_ptr)
+                    else:
+                        cute.copy(tma_atom_h, tHgH1, tHsH1, tma_bar_ptr=mbar_h_ptr)
+                cute.arch.mbarrier_wait(mbar_h_ptr, 0 if _eh == 0 else 1)
+                cute.arch.fence_view_async_shared()
             sync_threads()
 
             for _em in cutlass.range_constexpr(2):
@@ -2656,7 +2663,11 @@ def gated_delta_rule_mtp(
     # unlocking the 7-CTA SMEM limit (29.8 KB/CTA): theoretical occupancy 37.5% -> 43.75%,
     # ~1-7% faster across BS=16..256 with bit-identical output. mbp=12 (40 regs) gains no
     # further occupancy (SMEM-capped at 7 CTAs) and is slower — do not raise past 8.
-    mbp = max(1, min(_needed + 1, 8))
+    # Flush variant: cap 6, not the output-only kernel's 8. Phase 5 adds ~4.4KB
+    # SMEM (k_snap) -> 6 CTAs/SM SMEM-capped anyway, and the KH accumulators add
+    # 16 live regs; measured B200 B=256: mbp=6 394/218 us (f=1/f=0) vs mbp=8
+    # 411/231 vs mbp=4 400/255.
+    mbp = max(1, min(_needed + 1, 6))
     # GDN_WY_MBP overrides min_blocks_per_mp (launch bounds) for perf experiments.
     # mbp is part of cache_key, so each value compiles its own kernel.
     _mbp_env = _os.environ.get("GDN_WY_MBP")

@@ -54,6 +54,8 @@ def main():
                     default=[1, 2, 4, 8, 16, 32, 64, 128, 256])
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iters", type=int, default=500)
+    ap.add_argument("--sweep-batches", type=int, nargs="*", default=[64, 256],
+                    help="batch sizes at which to run the flush-rate sweep")
     args = ap.parse_args()
     torch.set_grad_enabled(False)
 
@@ -119,6 +121,26 @@ def main():
             f"{rs_kb:8.2f} | {a1 / rs_kb:6.2f}x {rs_v1 / rs_kb:6.2f}x",
             flush=True,
         )
+        if B in args.sweep_batches:
+            # Per-request flushing (always-kernel-B mode): cost of one kernel-B
+            # launch vs the fraction of requests actually folding this
+            # iteration. P=12 for ceil(f*B) random slots, 0 elsewhere.
+            g = torch.Generator().manual_seed(0)
+            print(f"     flush-rate sweep (B={B}, one kernel-B launch/iter):")
+            for f_pct in (0, 10, 20, 30, 40, 50, 60, 80, 100):
+                n_f = (f_pct * B + 99) // 100
+                perm = torch.randperm(B, generator=g)[:n_f]
+                p_mix = torch.zeros(B, dtype=torch.int32)
+                p_mix[perm] = 12
+                p_mix = p_mix.cuda()
+                t_f = t_us(lambda: wy_flush(
+                    **tok16, **common, initial_state_source=state,
+                    disable_state_update=False, flush_steps=p_mix))
+                print(
+                    f"       f={f_pct:>3}%  ({n_f:>3} fold) : {t_f:8.2f} us"
+                    f"   -> {a1 / t_f:5.2f}x vs A1/iter",
+                    flush=True,
+                )
 
 
 if __name__ == "__main__":
