@@ -2080,7 +2080,13 @@ class GdnFlushKernel:
         # Output staging tile [T, V_PADDED] bf16 aliased onto h_buf (16 KiB;
         # needs 4.25 KiB). sH's last read is the half-1 H GEMM; every warp is
         # past it once the sync below (before QT@V) has run.
-        _sOutStage_base = sH.iterator.toint()
+        # v2 flush-variant: stage outputs through sK, NOT sH. A_full (sK) is
+        # dead after the half-1 H GEMM and the [T, V_PADDED] tile is an exact
+        # fit (V_PADDED == K_PADDED == 136). Keeping sH untouched preserves the
+        # H0 half-1 tile through the output flush, so Phase-5 Step E processes
+        # half-1 from RESIDENT SMEM (no TMA re-read; only half-0 re-fetches).
+        # C is staged into sK afterwards (it is free again post output-flush).
+        _sOutStage_base = _sK_base_vl
 
         # 4 V-groups per warp at 8 V-cols each → byte stride = 8*2 = 16 within a warp,
         # warp_id stride in V-cols = 32 → 64 bytes between warps.
@@ -2246,37 +2252,36 @@ class GdnFlushKernel:
             )
         sync_threads()
 
-        # --- Step E: per K-half, re-load H0 into sH (3rd/4th TMA arrival ->
-        # mbarrier parity 0/1 again) and store
-        #   H0_new[v, k] = exp(G_P) * H0[v, k] + (U^T @ Khat)[v, k]
+        # --- Step E (v2): H0_new[v,k] = exp(G_P)*H0[v,k] + (U^T @ Khat)[v,k].
+        # Half-1 runs FIRST, from the still-resident sH (the output epilogue
+        # now stages through sK, so H0 half-1 survives Phase 4) — no TMA;
+        # only half-0 re-fetches (3rd mbarrier arrival -> parity 0, predicated
+        # on p_val > 0 per v1.5). Store path (v2): each lane STS's its H0_new
+        # fragment back to the SAME swizzled sH bytes it just read (thread-
+        # local, hazard-free), then a coalesced 16-B LDS/STG flush mirrors the
+        # output epilogue — replaces v1's 4-B uncoalesced state STGs.
         # M = 128 V-rows: warp handles tiles [warp*32, +16) and [+16, +32).
         _gH0_base = gH0.iterator.toint()
         _sh_hv_p5 = V_DIM * K_DIM
         _h0_off_base = cache_idx * (HV * _sh_hv_p5) + pid_hv * _sh_hv_p5
         _sUT_int = sUT.iterator.toint()
         _sH_int_p5 = sH.iterator.toint()
-        for _eh in cutlass.range_constexpr(2):
-            sync_threads()  # all lanes past the previous sH contents
-            # v1.5: the H0 re-read is the only per-CTA Phase-5 memory cost that
-            # scales with the batch flush rate — predicate it (and its wait) on
-            # p_val > 0. The branch is CTA-uniform (p_val is a per-request
-            # scalar), so the barrier accounting stays consistent per CTA; the
-            # MMA/LDS math below still runs unconditionally on stale sH for
-            # P=0 CTAs (harmless — their stores are predicated off).
-            if p_val > Int32(0):
-                if warp_id == 0:
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            mbar_h_ptr,
-                            V_DIM_C * K_HALF * 2,
-                        )
-                    if _eh == 0:
+        for _eh in (1, 0):
+            if _eh == 0:
+                # Half-0 re-fetch. All lanes must be past half-1's coalesced
+                # flush reads of sH before the TMA overwrites it.
+                sync_threads()
+                if p_val > Int32(0):
+                    if warp_id == 0:
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                mbar_h_ptr,
+                                V_DIM_C * K_HALF * 2,
+                            )
                         cute.copy(tma_atom_h, tHgH0, tHsH0, tma_bar_ptr=mbar_h_ptr)
-                    else:
-                        cute.copy(tma_atom_h, tHgH1, tHsH1, tma_bar_ptr=mbar_h_ptr)
-                cute.arch.mbarrier_wait(mbar_h_ptr, 0 if _eh == 0 else 1)
-                cute.arch.fence_view_async_shared()
-            sync_threads()
+                    cute.arch.mbarrier_wait(mbar_h_ptr, 0)
+                    cute.arch.fence_view_async_shared()
+                sync_threads()
 
             for _em in cutlass.range_constexpr(2):
                 _e_mbase = warp_id * Int32(32) + Int32(_em * 16)
@@ -2298,43 +2303,53 @@ class GdnFlushKernel:
                         _e_kcl = _en * 32 + _eg * 8 + _p5_c0  # col within half
                         _e_rv0 = _e_mbase + _p5_r0
                         _e_rv8 = _e_rv0 + Int32(8)
-                        _h0p0 = _lds_b32(
-                            _sw128_xor(
-                                _sH_int_p5 + _e_rv0 * _rs_b + _e_kcl * 2
-                            )
+                        _e_sa0 = _sw128_xor(
+                            _sH_int_p5 + _e_rv0 * _rs_b + _e_kcl * 2
                         )
-                        _h0p8 = _lds_b32(
-                            _sw128_xor(
-                                _sH_int_p5 + _e_rv8 * _rs_b + _e_kcl * 2
-                            )
+                        _e_sa8 = _sw128_xor(
+                            _sH_int_p5 + _e_rv8 * _rs_b + _e_kcl * 2
                         )
-                        _h0l0, _h0h0 = _bf16x2_to_f32x2(_h0p0)
-                        _h0l8, _h0h8 = _bf16x2_to_f32x2(_h0p8)
-                        _e_off0 = (
-                            _h0_off_base
-                            + _e_rv0 * K_DIM
-                            + Int32(_eh * K_HALF)
-                            + _e_kcl
-                        )
-                        _e_off8 = (
-                            _h0_off_base
-                            + _e_rv8 * K_DIM
-                            + Int32(_eh * K_HALF)
-                            + _e_kcl
-                        )
-                        if p_val > Int32(0):
-                            _st_global_bf16x2_f32(
-                                _gH0_base,
-                                _e_off0,
+                        _h0l0, _h0h0 = _bf16x2_to_f32x2(_lds_b32(_e_sa0))
+                        _h0l8, _h0h8 = _bf16x2_to_f32x2(_lds_b32(_e_sa8))
+                        if p_val > Int32(0):  # P=0 CTAs skip the store path
+                            _sts_bf16x2_f32(
+                                _e_sa0,
                                 _exp_gp * _h0l0 + _er[_eg * 4 + 0],
                                 _exp_gp * _h0h0 + _er[_eg * 4 + 1],
                             )
-                            _st_global_bf16x2_f32(
-                                _gH0_base,
-                                _e_off8,
+                            _sts_bf16x2_f32(
+                                _e_sa8,
                                 _exp_gp * _h0l8 + _er[_eg * 4 + 2],
                                 _exp_gp * _h0h8 + _er[_eg * 4 + 3],
                             )
+
+            # Coalesced flush of this half's H0_new tile: 128 rows x 8 16-B
+            # chunks; consecutive lanes cover consecutive chunks (full 32-B
+            # sectors). LDS applies the same SW128 xor the STS used; the gmem
+            # offset uses the LOGICAL (row, chunk) coords. The whole loop sits
+            # inside the p_val guard so P=0 CTAs skip it entirely; the LDS uses
+            # 4x single-word _lds_b32 (single-value returns are legal inside a
+            # runtime if-region; the tuple-returning _lds_v4_b32 is not).
+            sync_threads()
+            if p_val > Int32(0):
+                for _ep in cutlass.range_constexpr(8):
+                    _e_chunk = tidx + _ep * THREADS
+                    _e_frow = _e_chunk >> 3
+                    _e_fpos = _e_chunk & Int32(7)
+                    _e_lds = _sw128_xor(
+                        _sH_int_p5 + _e_frow * _rs_b + _e_fpos * 16
+                    )
+                    _ev0 = _lds_b32(_e_lds)
+                    _ev1 = _lds_b32(_e_lds + 4)
+                    _ev2 = _lds_b32(_e_lds + 8)
+                    _ev3 = _lds_b32(_e_lds + 12)
+                    _e_goff = (
+                        _h0_off_base
+                        + _e_frow * K_DIM
+                        + Int32(_eh * K_HALF)
+                        + _e_fpos * 8
+                    )
+                    _st_global_v4_b32(_gH0_base, _e_goff, _ev0, _ev1, _ev2, _ev3)
 
 
 # ============================================================================
