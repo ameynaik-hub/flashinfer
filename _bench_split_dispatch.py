@@ -24,6 +24,9 @@ import math
 import numpy as np
 import torch
 
+from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+    gated_delta_rule_mtp as branch_mtp,
+)
 from flashinfer.gdn_kernels.gdn_decode_bf16_wy_output_only import (
     gated_delta_rule_mtp as wy_out,
 )
@@ -32,7 +35,7 @@ from flashinfer.gdn_kernels.gdn_decode_bf16_wy_state_and_output import (
 )
 from flashinfer.testing import bench_gpu_time
 
-H, HV, K_DIM, V_DIM = 16, 64, 128, 128
+H, HV, K_DIM, V_DIM = 16, 64, 128, 128  # H/HV overridable via --H/--HV (TP shards)
 SCALE = 1.0 / math.sqrt(K_DIM)
 
 
@@ -50,11 +53,15 @@ def make_tok(B):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--B", type=int, default=256)
+    ap.add_argument("--HV", type=int, default=64, help="v-heads per GPU (TP-sharded)")
+    ap.add_argument("--H", type=int, default=16, help="q/k heads per GPU (TP-sharded)")
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iters", type=int, default=300)
     args = ap.parse_args()
     torch.set_grad_enabled(False)
     B = args.B
+    global H, HV
+    H, HV = args.H, args.HV
 
     with torch.device("cuda"):
         A_log = torch.randn(HV, dtype=torch.float32) * 0.1
@@ -74,9 +81,23 @@ def main():
             * 1000
         )
 
+    # A1 reference: today's per-iteration cost = WY verify(T=4) + branch fold(4).
+    tok4 = {k: (v[:, :4].contiguous() if v.dim() > 2 else v)
+            for k, v in make_tok(B).items()}
+    idx_all0 = torch.arange(B, dtype=torch.int32, device="cuda")
+    acc4 = torch.full((B,), 3, dtype=torch.int32, device="cuda")
+    a1 = t_us(lambda: wy_out(
+        **tok4, **common, initial_state_source=state,
+        initial_state_indices=idx_all0, disable_state_update=True,
+    )) + t_us(lambda: branch_mtp(
+        **tok4, **common, initial_state_source=state,
+        initial_state_indices=idx_all0, accepted_steps=acc4,
+        disable_state_update=False, disable_output=True,
+    ))
+
     print(
-        f"GPU: {torch.cuda.get_device_name()}  B={B} HV={HV} bf16, "
-        f"CUPTI cold-L2 median of {args.iters}\n"
+        f"GPU: {torch.cuda.get_device_name()}  B={B} HV={HV} H={H} bf16, "
+        f"CUPTI cold-L2 median of {args.iters} | A1 (verify4+fold4) = {a1:.2f} us\n"
     )
     hdr = (
         f"{'f%':>4} {'n_fl':>5} | {'single':>8} | {'split':>8} {'(fl+ln)':>15} | "
@@ -85,7 +106,7 @@ def main():
     print(hdr)
     print("-" * len(hdr))
     g = torch.Generator().manual_seed(0)
-    for f_pct in (10, 20, 30, 40, 50, 60, 80):
+    for f_pct in (10, 20, 30, 33, 40, 50, 60, 80):
         n_f = (f_pct * B + 99) // 100
         perm = torch.randperm(B, generator=g)
         fl_idx = perm[:n_f].sort().values.to("cuda")
