@@ -1,0 +1,5 @@
+GPU: NVIDIA B200  conc=256 HV=16 H=4 (TP4)
+case 0a  output-only, all 256, T=4 rows        :   34.85 us
+case 0b  output-only, all 256, 16-row window   :   39.12 us
+case A   single kernel-B, all 256, 33% flush   :   66.34 us
+case B   split: kernel-B(85) + output-only(171):   60.42 us graphed  (30.50 + 28.48; eager 170.03 incl. host gap)
