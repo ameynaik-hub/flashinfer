@@ -2232,6 +2232,11 @@ class GdnFlushKernel:
         _p5_c0 = (lane_id & 3) * 2
         _eg_lo = sGamma.iterator[T + _p5_r0]
         _eg_hi = sGamma.iterator[T + _p5_r0 + 8]
+        # Rows >= P are staged as LITERAL zeros in both C and U^T below: the
+        # MMAs reduce over all 16 rows, and 0 * NaN = NaN, so a single NaN/Inf
+        # in a garbage draft row would otherwise leak into H0_new even though
+        # its weight is zero (campaign NaN-drafts probe). Both operands of
+        # every dead product must be finite.
         _kh_frags = (kh_acc_0, kh_acc_1, kh_acc_2, kh_acc_3)
         for _cg in cutlass.range_constexpr(4):
             _khf = _kh_frags[_cg]
@@ -2240,18 +2245,20 @@ class GdnFlushKernel:
             _cv1 = sV.iterator[_p5_r0 * V_PADDED + _c_col + 1].to(f32)
             _cv2 = sV.iterator[(_p5_r0 + 8) * V_PADDED + _c_col].to(f32)
             _cv3 = sV.iterator[(_p5_r0 + 8) * V_PADDED + _c_col + 1].to(f32)
-            sK.iterator[_p5_r0 * K_PADDED + _c_col] = (
-                _cv0 - _eg_lo * _khf.iterator[0]
-            ).to(io)
-            sK.iterator[_p5_r0 * K_PADDED + _c_col + 1] = (
-                _cv1 - _eg_lo * _khf.iterator[1]
-            ).to(io)
-            sK.iterator[(_p5_r0 + 8) * K_PADDED + _c_col] = (
-                _cv2 - _eg_hi * _khf.iterator[2]
-            ).to(io)
-            sK.iterator[(_p5_r0 + 8) * K_PADDED + _c_col + 1] = (
-                _cv3 - _eg_hi * _khf.iterator[3]
-            ).to(io)
+            _cw0 = (_cv0 - _eg_lo * _khf.iterator[0]).to(io)
+            _cw1 = (_cv1 - _eg_lo * _khf.iterator[1]).to(io)
+            _cw2 = (_cv2 - _eg_hi * _khf.iterator[2]).to(io)
+            _cw3 = (_cv3 - _eg_hi * _khf.iterator[3]).to(io)
+            if _p5_r0 >= p_val:
+                _cw0 = io(0.0)
+                _cw1 = io(0.0)
+            if _p5_r0 + Int32(8) >= p_val:
+                _cw2 = io(0.0)
+                _cw3 = io(0.0)
+            sK.iterator[_p5_r0 * K_PADDED + _c_col] = _cw0
+            sK.iterator[_p5_r0 * K_PADDED + _c_col + 1] = _cw1
+            sK.iterator[(_p5_r0 + 8) * K_PADDED + _c_col] = _cw2
+            sK.iterator[(_p5_r0 + 8) * K_PADDED + _c_col + 1] = _cw3
         sync_threads()
 
         # --- U = Tmat @ C (QT@V-shaped MMA; C staged in sK, K_PADDED ==
@@ -2264,10 +2271,20 @@ class GdnFlushKernel:
         # before the sync above): [V_DIM_C, T] row-major, row stride 32 B.
         for _ug in cutlass.range_constexpr(4):
             _u_col = (warp_id * 4 + _ug) * 8 + _p5_c0
-            sUT.iterator[_u_col * T + _p5_r0] = _ur[_ug * 4 + 0].to(io)
-            sUT.iterator[(_u_col + 1) * T + _p5_r0] = _ur[_ug * 4 + 1].to(io)
-            sUT.iterator[_u_col * T + _p5_r0 + 8] = _ur[_ug * 4 + 2].to(io)
-            sUT.iterator[(_u_col + 1) * T + _p5_r0 + 8] = _ur[_ug * 4 + 3].to(io)
+            _uw0 = _ur[_ug * 4 + 0].to(io)
+            _uw1 = _ur[_ug * 4 + 1].to(io)
+            _uw2 = _ur[_ug * 4 + 2].to(io)
+            _uw3 = _ur[_ug * 4 + 3].to(io)
+            if _p5_r0 >= p_val:  # U rows >= P: literal zeros (see C staging)
+                _uw0 = io(0.0)
+                _uw1 = io(0.0)
+            if _p5_r0 + Int32(8) >= p_val:
+                _uw2 = io(0.0)
+                _uw3 = io(0.0)
+            sUT.iterator[_u_col * T + _p5_r0] = _uw0
+            sUT.iterator[(_u_col + 1) * T + _p5_r0] = _uw1
+            sUT.iterator[_u_col * T + _p5_r0 + 8] = _uw2
+            sUT.iterator[(_u_col + 1) * T + _p5_r0 + 8] = _uw3
 
         # --- Step D: Khat = diag(i < P ? exp(G_P - G_i) : 0) * k_norm, scaling
         # sKsnap in place (bf16x2 words). exp(G_P - G_i) <= 1 for i < P (G is a
@@ -2276,15 +2293,18 @@ class GdnFlushKernel:
             _kd_flat = tidx + _kd * THREADS
             _kd_row = _kd_flat >> 6
             _kd_col = _kd_flat & Int32(63)
-            _kd_f = f32(0.0)
+            _kd_addr = _kd_row * (K_PADDED // 2) + _kd_col
             if _kd_row < p_val:
                 _kd_f = _exp_approx_f32(_g_p - sGamma.iterator[_kd_row])
-            _sKsnap_i32.iterator[_kd_row * (K_PADDED // 2) + _kd_col] = (
-                _mul_bf16x2_f32(
-                    _sKsnap_i32.iterator[_kd_row * (K_PADDED // 2) + _kd_col],
-                    _kd_f,
+                _sKsnap_i32.iterator[_kd_addr] = _mul_bf16x2_f32(
+                    _sKsnap_i32.iterator[_kd_addr], _kd_f
                 )
-            )
+            else:
+                # Write a LITERAL zero for rows >= P. Multiplying by 0 would
+                # keep NaN/Inf from garbage draft rows alive (0*NaN = NaN) and
+                # leak them into H0_new through the U^T @ Khat reduction
+                # (caught by the correctness campaign's NaN-drafts probe).
+                _sKsnap_i32.iterator[_kd_addr] = Int32(0)
         sync_threads()
 
         # --- Step E (v2): H0_new[v,k] = exp(G_P)*H0[v,k] + (U^T @ Khat)[v,k].
