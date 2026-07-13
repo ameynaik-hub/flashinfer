@@ -1,0 +1,28 @@
+GPU: NVIDIA B200
+== A. shape/seed/P sweep ==
+  config (H=16, HV=64) done
+  config (H=16, HV=32) done
+  config (H=4, HV=16) done
+  config (H=8, HV=32) done
+A done
+== B. P edge cases (incl. eviction folds) ==
+B done
+== C. isolation & shuffled pool ==
+C done
+== D. adversarial values ==
+D done
+== E. non-contiguous / stride edges ==
+E done
+== F. allocator churn ==
+F done
+== G. CUDA-graph replay vs eager ==
+G done
+== H. mixed-config interleaving ==
+H done
+== I. 200-fold in-place chain soak ==
+  drift max=7.23e-03 first50=6.58e-03 last50=6.84e-03
+I done
+== J. concurrent-stream overlap ==
+J done
+
+ALL SECTIONS PASS
