@@ -1,0 +1,3 @@
+GPU: NVIDIA B200
+HV=64 H=16 B=256: state-only fold  242.85 us | fused flush  294.09 | branch recovery  710.75
+HV=16 H= 4 B=256: state-only fold   65.92 us | fused flush   78.18 | branch recovery  194.78

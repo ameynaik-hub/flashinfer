@@ -765,7 +765,14 @@ class GdnFlushKernel:
         n_valid=16,
         qkv_row_stride=0,
         ab_native=False,
+        state_only=False,
     ):
+        # state_only=True compiles the FOLD-ONLY specialization (for overlap
+        # with the draft phase): drops q load/norm, QKT, QT, A_full, the
+        # output H GEMM, QT@V and the output epilogue; keeps k-norm -> KKT ->
+        # Tmat -> KH (primary in the H0 half loops) -> C/U/Khat -> Step E.
+        # gQ/gOut are never read/written (pass dummies).
+        self._state_only = bool(state_only)
         assert t_input == 16 and n_valid == 16, (
             "state_and_output variant supports only the full 16-row window"
         )
@@ -1137,11 +1144,12 @@ class GdnFlushKernel:
                     k_base + _kq_row * sk_t + _kq_col_bf16_async,
                     _sK_base_async + _smem_byte_off,
                 )
-                _cp_async_bf16x8(
-                    _gQ_base,
-                    q_base + _kq_row * sq_t + _kq_col_bf16_async,
-                    _sQ_base_async + _smem_byte_off,
-                )
+                if const_expr(not self._state_only):
+                    _cp_async_bf16x8(
+                        _gQ_base,
+                        q_base + _kq_row * sq_t + _kq_col_bf16_async,
+                        _sQ_base_async + _smem_byte_off,
+                    )
         _cp_async_commit_group()  # group 0 = K+Q
 
         # ============================================================
@@ -1287,25 +1295,29 @@ class GdnFlushKernel:
                     _sK_i32.iterator[_norm_off_i32 + 4 * c] = _mul_bf16x2_f32(
                         _sK_i32.iterator[_norm_off_i32 + 4 * c], inv_norm
                     )
-            if warp_id >= 2:
-                norm_row = (warp_id - 2) * 8 + lane_id // 4
-                norm_quarter = lane_id % 4
-                _norm_off_i32 = norm_row * (K_PADDED // 2) + norm_quarter
-                partial = f32(0.0)
-                for c in cutlass.range_constexpr(16):
-                    packed = _sQ_i32.iterator[_norm_off_i32 + 4 * c]
-                    partial = _dot_sq_bf16x2(packed, partial)
-                for d in [1, 2]:
-                    other = cute.arch.shuffle_sync(
-                        partial, Int32(lane_id ^ d), Int32(0xFFFFFFFF), Int32(0x1F)
-                    )
-                    partial = partial + other
-                inv_norm = _rsqrt_approx_f32(partial + f32(EPS))
-                inv_norm = inv_norm * scale
-                for c in cutlass.range_constexpr(16):
-                    _sQ_i32.iterator[_norm_off_i32 + 4 * c] = _mul_bf16x2_f32(
-                        _sQ_i32.iterator[_norm_off_i32 + 4 * c], inv_norm
-                    )
+            if const_expr(not self._state_only):
+                if warp_id >= 2:
+                    norm_row = (warp_id - 2) * 8 + lane_id // 4
+                    norm_quarter = lane_id % 4
+                    _norm_off_i32 = norm_row * (K_PADDED // 2) + norm_quarter
+                    partial = f32(0.0)
+                    for c in cutlass.range_constexpr(16):
+                        packed = _sQ_i32.iterator[_norm_off_i32 + 4 * c]
+                        partial = _dot_sq_bf16x2(packed, partial)
+                    for d in [1, 2]:
+                        other = cute.arch.shuffle_sync(
+                            partial,
+                            Int32(lane_id ^ d),
+                            Int32(0xFFFFFFFF),
+                            Int32(0x1F),
+                        )
+                        partial = partial + other
+                    inv_norm = _rsqrt_approx_f32(partial + f32(EPS))
+                    inv_norm = inv_norm * scale
+                    for c in cutlass.range_constexpr(16):
+                        _sQ_i32.iterator[_norm_off_i32 + 4 * c] = _mul_bf16x2_f32(
+                            _sQ_i32.iterator[_norm_off_i32 + 4 * c], inv_norm
+                        )
         sync_threads()
 
         # Phase 5: snapshot the L2-normed k rows into sKsnap NOW — sK is about
@@ -1352,17 +1364,24 @@ class GdnFlushKernel:
                         acc.iterator[3],
                     )
                 )
-            if warp_id >= 2:
-                col_off = (warp_id - Int32(2)) * Int32(8)
-                _a_base = _sQ_int + _lane_mod16 * _rs_kpad + _lane_hi + k_group_off
-                _b_direct = (
-                    _sK_int
-                    + (col_off + _lane_mod8) * _rs_kpad
-                    + k_group_off
-                    + _lane_b_col
-                )
-                acc.iterator[0], acc.iterator[1], acc.iterator[2], acc.iterator[3] = (
-                    _fused_ab_4mma_serial_brow(
+            if const_expr(not self._state_only):
+                if warp_id >= 2:
+                    col_off = (warp_id - Int32(2)) * Int32(8)
+                    _a_base = (
+                        _sQ_int + _lane_mod16 * _rs_kpad + _lane_hi + k_group_off
+                    )
+                    _b_direct = (
+                        _sK_int
+                        + (col_off + _lane_mod8) * _rs_kpad
+                        + k_group_off
+                        + _lane_b_col
+                    )
+                    (
+                        acc.iterator[0],
+                        acc.iterator[1],
+                        acc.iterator[2],
+                        acc.iterator[3],
+                    ) = _fused_ab_4mma_serial_brow(
                         _a_base,
                         _b_direct,
                         acc.iterator[0],
@@ -1370,7 +1389,6 @@ class GdnFlushKernel:
                         acc.iterator[2],
                         acc.iterator[3],
                     )
-                )
         _r0 = lane_id // 4
         _c0 = (lane_id & 3) * 2
         if warp_id < 2:
@@ -1379,14 +1397,19 @@ class GdnFlushKernel:
             sMat.iterator[_smat_off(_r0, col_off + _c0 + 1)] = acc.iterator[1]
             sMat.iterator[_smat_off(_r0 + 8, col_off + _c0)] = acc.iterator[2]
             sMat.iterator[_smat_off(_r0 + 8, col_off + _c0 + 1)] = acc.iterator[3]
-        if warp_id >= 2:
-            col_off = (warp_id - Int32(2)) * Int32(8)
-            sNegL.iterator[_r0 * BF_PAD + col_off + _c0] = acc.iterator[0].to(io)
-            sNegL.iterator[_r0 * BF_PAD + col_off + _c0 + 1] = acc.iterator[1].to(io)
-            sNegL.iterator[(_r0 + 8) * BF_PAD + col_off + _c0] = acc.iterator[2].to(io)
-            sNegL.iterator[(_r0 + 8) * BF_PAD + col_off + _c0 + 1] = acc.iterator[3].to(
-                io
-            )
+        if const_expr(not self._state_only):
+            if warp_id >= 2:
+                col_off = (warp_id - Int32(2)) * Int32(8)
+                sNegL.iterator[_r0 * BF_PAD + col_off + _c0] = acc.iterator[0].to(io)
+                sNegL.iterator[_r0 * BF_PAD + col_off + _c0 + 1] = acc.iterator[
+                    1
+                ].to(io)
+                sNegL.iterator[(_r0 + 8) * BF_PAD + col_off + _c0] = acc.iterator[
+                    2
+                ].to(io)
+                sNegL.iterator[(_r0 + 8) * BF_PAD + col_off + _c0 + 1] = (
+                    acc.iterator[3].to(io)
+                )
         sync_threads()
 
         # ============================================================
@@ -1408,10 +1431,11 @@ class GdnFlushKernel:
                     else f32(0.0)
                 )
             )
-            qkt = sNegL.iterator[r * BF_PAD + c].to(f32)
-            sNegL.iterator[r * BF_PAD + c] = (
-                (qkt * exp_gij).to(io) if r >= c else io(0.0)
-            )
+            if const_expr(not self._state_only):
+                qkt = sNegL.iterator[r * BF_PAD + c].to(f32)
+                sNegL.iterator[r * BF_PAD + c] = (
+                    (qkt * exp_gij).to(io) if r >= c else io(0.0)
+                )
             kkt_val = sMat.iterator[_smat_off(r, c)]
             negL_val = (
                 (f32(0.0) - sBeta.iterator[r] * exp_gij * kkt_val)
@@ -1627,20 +1651,27 @@ class GdnFlushKernel:
         # ============================================================
         # PRECOMPUTE QT and A_full (V-tile independent)
         # ============================================================
-        # QT = QKTm @ Tmat → sPowk
-        if warp_id < 2:
-            acc.fill(f32(0.0))
-            col_off = warp_id * 8
-            _qt_a_addr = (
-                sNegL.iterator.toint() + _lane_mod16 * Int32(BF_PAD * 2) + _lane_hi
-            )
-            _qt_b_addr = (
-                sTmat.iterator.toint()
-                + _ldm_row * Int32(BF_PAD * 2)
-                + col_off * Int32(2)
-            )
-            acc.iterator[0], acc.iterator[1], acc.iterator[2], acc.iterator[3] = (
-                _fused_ab_1mma(
+        # QT = QKTm @ Tmat → sPowk   [output path — skipped in state_only]
+        if const_expr(not self._state_only):
+            if warp_id < 2:
+                acc.fill(f32(0.0))
+                col_off = warp_id * 8
+                _qt_a_addr = (
+                    sNegL.iterator.toint()
+                    + _lane_mod16 * Int32(BF_PAD * 2)
+                    + _lane_hi
+                )
+                _qt_b_addr = (
+                    sTmat.iterator.toint()
+                    + _ldm_row * Int32(BF_PAD * 2)
+                    + col_off * Int32(2)
+                )
+                (
+                    acc.iterator[0],
+                    acc.iterator[1],
+                    acc.iterator[2],
+                    acc.iterator[3],
+                ) = _fused_ab_1mma(
                     _qt_a_addr,
                     _qt_b_addr,
                     acc.iterator[0],
@@ -1648,60 +1679,69 @@ class GdnFlushKernel:
                     acc.iterator[2],
                     acc.iterator[3],
                 )
-            )
-            _r0 = lane_id // 4
-            _c0 = (lane_id & 3) * 2
-            sPowk.iterator[_r0 * BF_PAD + col_off + _c0] = acc.iterator[0].to(io)
-            sPowk.iterator[_r0 * BF_PAD + col_off + _c0 + 1] = acc.iterator[1].to(io)
-            sPowk.iterator[(_r0 + 8) * BF_PAD + col_off + _c0] = acc.iterator[2].to(io)
-            sPowk.iterator[(_r0 + 8) * BF_PAD + col_off + _c0 + 1] = acc.iterator[3].to(
-                io
-            )
+                _r0 = lane_id // 4
+                _c0 = (lane_id & 3) * 2
+                sPowk.iterator[_r0 * BF_PAD + col_off + _c0] = acc.iterator[0].to(io)
+                sPowk.iterator[_r0 * BF_PAD + col_off + _c0 + 1] = acc.iterator[
+                    1
+                ].to(io)
+                sPowk.iterator[(_r0 + 8) * BF_PAD + col_off + _c0] = acc.iterator[
+                    2
+                ].to(io)
+                sPowk.iterator[(_r0 + 8) * BF_PAD + col_off + _c0 + 1] = (
+                    acc.iterator[3].to(io)
+                )
 
-        # eK = exp(gamma) * K_normed → sK
-        _ek_iters = (self._t_input * K_DIM) // (THREADS * 4)
-        for i in cutlass.range_constexpr(_ek_iters):
-            _ek_row = warp_id + i * (THREADS // WARP)
-            _ek_exp = sGamma.iterator[T + _ek_row]
-            _ek_base = _ek_row * _kpad_i32 + lane_id
-            _sK_i32.iterator[_ek_base] = _mul_bf16x2_f32(
-                _sK_i32.iterator[_ek_base], _ek_exp
-            )
-            _sK_i32.iterator[_ek_base + WARP] = _mul_bf16x2_f32(
-                _sK_i32.iterator[_ek_base + WARP], _ek_exp
-            )
+            # eK = exp(gamma) * K_normed → sK
+            _ek_iters = (self._t_input * K_DIM) // (THREADS * 4)
+            for i in cutlass.range_constexpr(_ek_iters):
+                _ek_row = warp_id + i * (THREADS // WARP)
+                _ek_exp = sGamma.iterator[T + _ek_row]
+                _ek_base = _ek_row * _kpad_i32 + lane_id
+                _sK_i32.iterator[_ek_base] = _mul_bf16x2_f32(
+                    _sK_i32.iterator[_ek_base], _ek_exp
+                )
+                _sK_i32.iterator[_ek_base + WARP] = _mul_bf16x2_f32(
+                    _sK_i32.iterator[_ek_base + WARP], _ek_exp
+                )
         sync_threads()
 
-        # QT@eK → A_full residual contribution
-        _qt_a0, _qt_a1, _qt_a2, _qt_a3 = _ldmatrix_x4(sPowk, lane_id)
-        _sK_base_af = sK.iterator.toint()
-        _af_b_base = _sK_base_af + _ldm_row * Int32(K_PADDED * 2) + warp_id * Int32(16)
-        _afr = _afull_4mma(_qt_a0, _qt_a1, _qt_a2, _qt_a3, _af_b_base)
+        if const_expr(not self._state_only):
+            # QT@eK → A_full residual contribution
+            _qt_a0, _qt_a1, _qt_a2, _qt_a3 = _ldmatrix_x4(sPowk, lane_id)
+            _sK_base_af = sK.iterator.toint()
+            _af_b_base = (
+                _sK_base_af + _ldm_row * Int32(K_PADDED * 2) + warp_id * Int32(16)
+            )
+            _afr = _afull_4mma(_qt_a0, _qt_a1, _qt_a2, _qt_a3, _af_b_base)
 
-        # A_full = eQ - QT@eK → sK (overwrite eK)
-        _r0 = lane_id // 4
-        _c0 = (lane_id & 3) * 2
-        _exp_eq_r0 = sGamma.iterator[T + _r0]
-        _exp_eq_r8 = sGamma.iterator[T + _r0 + 8]
-        BK_GROUPS = K_DIM // 32  # = 4
-        for bk_idx in cutlass.range_constexpr(BK_GROUPS):
-            k_col = bk_idx * 32 + warp_id * 8
-            sK.iterator[_r0 * K_PADDED + k_col + _c0] = (
-                _exp_eq_r0 * sQ.iterator[_r0 * K_PADDED + k_col + _c0].to(f32)
-                - _afr[bk_idx * 4]
-            ).to(io)
-            sK.iterator[_r0 * K_PADDED + k_col + _c0 + 1] = (
-                _exp_eq_r0 * sQ.iterator[_r0 * K_PADDED + k_col + _c0 + 1].to(f32)
-                - _afr[bk_idx * 4 + 1]
-            ).to(io)
-            sK.iterator[(_r0 + 8) * K_PADDED + k_col + _c0] = (
-                _exp_eq_r8 * sQ.iterator[(_r0 + 8) * K_PADDED + k_col + _c0].to(f32)
-                - _afr[bk_idx * 4 + 2]
-            ).to(io)
-            sK.iterator[(_r0 + 8) * K_PADDED + k_col + _c0 + 1] = (
-                _exp_eq_r8 * sQ.iterator[(_r0 + 8) * K_PADDED + k_col + _c0 + 1].to(f32)
-                - _afr[bk_idx * 4 + 3]
-            ).to(io)
+            # A_full = eQ - QT@eK → sK (overwrite eK)
+            _r0 = lane_id // 4
+            _c0 = (lane_id & 3) * 2
+            _exp_eq_r0 = sGamma.iterator[T + _r0]
+            _exp_eq_r8 = sGamma.iterator[T + _r0 + 8]
+            BK_GROUPS = K_DIM // 32  # = 4
+            for bk_idx in cutlass.range_constexpr(BK_GROUPS):
+                k_col = bk_idx * 32 + warp_id * 8
+                sK.iterator[_r0 * K_PADDED + k_col + _c0] = (
+                    _exp_eq_r0 * sQ.iterator[_r0 * K_PADDED + k_col + _c0].to(f32)
+                    - _afr[bk_idx * 4]
+                ).to(io)
+                sK.iterator[_r0 * K_PADDED + k_col + _c0 + 1] = (
+                    _exp_eq_r0
+                    * sQ.iterator[_r0 * K_PADDED + k_col + _c0 + 1].to(f32)
+                    - _afr[bk_idx * 4 + 1]
+                ).to(io)
+                sK.iterator[(_r0 + 8) * K_PADDED + k_col + _c0] = (
+                    _exp_eq_r8
+                    * sQ.iterator[(_r0 + 8) * K_PADDED + k_col + _c0].to(f32)
+                    - _afr[bk_idx * 4 + 2]
+                ).to(io)
+                sK.iterator[(_r0 + 8) * K_PADDED + k_col + _c0 + 1] = (
+                    _exp_eq_r8
+                    * sQ.iterator[(_r0 + 8) * K_PADDED + k_col + _c0 + 1].to(f32)
+                    - _afr[bk_idx * 4 + 3]
+                ).to(io)
 
         # v12.2: CRITICAL barrier — sQ aliases sV in SMEM. All threads must
         # finish reading sQ above BEFORE any thread issues cp.async writes
@@ -1842,45 +1882,46 @@ class GdnFlushKernel:
             _b2 = _sw128_xor(_b2_l)
             _b3 = _sw128_xor(_b3_l)
 
-            _r = _h_gemm_4v(
-                _a_addr,
-                _b0,
-                _b1,
-                _b2,
-                _b3,
-                wh_acc_0.iterator[0],
-                wh_acc_0.iterator[1],
-                wh_acc_0.iterator[2],
-                wh_acc_0.iterator[3],
-                wh_acc_1.iterator[0],
-                wh_acc_1.iterator[1],
-                wh_acc_1.iterator[2],
-                wh_acc_1.iterator[3],
-                wh_acc_2.iterator[0],
-                wh_acc_2.iterator[1],
-                wh_acc_2.iterator[2],
-                wh_acc_2.iterator[3],
-                wh_acc_3.iterator[0],
-                wh_acc_3.iterator[1],
-                wh_acc_3.iterator[2],
-                wh_acc_3.iterator[3],
-            )
-            wh_acc_0.iterator[0] = _r[0]
-            wh_acc_0.iterator[1] = _r[1]
-            wh_acc_0.iterator[2] = _r[2]
-            wh_acc_0.iterator[3] = _r[3]
-            wh_acc_1.iterator[0] = _r[4]
-            wh_acc_1.iterator[1] = _r[5]
-            wh_acc_1.iterator[2] = _r[6]
-            wh_acc_1.iterator[3] = _r[7]
-            wh_acc_2.iterator[0] = _r[8]
-            wh_acc_2.iterator[1] = _r[9]
-            wh_acc_2.iterator[2] = _r[10]
-            wh_acc_2.iterator[3] = _r[11]
-            wh_acc_3.iterator[0] = _r[12]
-            wh_acc_3.iterator[1] = _r[13]
-            wh_acc_3.iterator[2] = _r[14]
-            wh_acc_3.iterator[3] = _r[15]
+            if const_expr(not self._state_only):
+                _r = _h_gemm_4v(
+                    _a_addr,
+                    _b0,
+                    _b1,
+                    _b2,
+                    _b3,
+                    wh_acc_0.iterator[0],
+                    wh_acc_0.iterator[1],
+                    wh_acc_0.iterator[2],
+                    wh_acc_0.iterator[3],
+                    wh_acc_1.iterator[0],
+                    wh_acc_1.iterator[1],
+                    wh_acc_1.iterator[2],
+                    wh_acc_1.iterator[3],
+                    wh_acc_2.iterator[0],
+                    wh_acc_2.iterator[1],
+                    wh_acc_2.iterator[2],
+                    wh_acc_2.iterator[3],
+                    wh_acc_3.iterator[0],
+                    wh_acc_3.iterator[1],
+                    wh_acc_3.iterator[2],
+                    wh_acc_3.iterator[3],
+                )
+                wh_acc_0.iterator[0] = _r[0]
+                wh_acc_0.iterator[1] = _r[1]
+                wh_acc_0.iterator[2] = _r[2]
+                wh_acc_0.iterator[3] = _r[3]
+                wh_acc_1.iterator[0] = _r[4]
+                wh_acc_1.iterator[1] = _r[5]
+                wh_acc_1.iterator[2] = _r[6]
+                wh_acc_1.iterator[3] = _r[7]
+                wh_acc_2.iterator[0] = _r[8]
+                wh_acc_2.iterator[1] = _r[9]
+                wh_acc_2.iterator[2] = _r[10]
+                wh_acc_2.iterator[3] = _r[11]
+                wh_acc_3.iterator[0] = _r[12]
+                wh_acc_3.iterator[1] = _r[13]
+                wh_acc_3.iterator[2] = _r[14]
+                wh_acc_3.iterator[3] = _r[15]
 
             # Phase 5 Step A (half-0): KHraw += k_norm[:, K-tile] @ sH-half^T.
             _a_addr_kh = (
@@ -1983,45 +2024,46 @@ class GdnFlushKernel:
             _b2 = _sw128_xor(_b2_l)
             _b3 = _sw128_xor(_b3_l)
 
-            _r = _h_gemm_4v(
-                _a_addr,
-                _b0,
-                _b1,
-                _b2,
-                _b3,
-                wh_acc_0.iterator[0],
-                wh_acc_0.iterator[1],
-                wh_acc_0.iterator[2],
-                wh_acc_0.iterator[3],
-                wh_acc_1.iterator[0],
-                wh_acc_1.iterator[1],
-                wh_acc_1.iterator[2],
-                wh_acc_1.iterator[3],
-                wh_acc_2.iterator[0],
-                wh_acc_2.iterator[1],
-                wh_acc_2.iterator[2],
-                wh_acc_2.iterator[3],
-                wh_acc_3.iterator[0],
-                wh_acc_3.iterator[1],
-                wh_acc_3.iterator[2],
-                wh_acc_3.iterator[3],
-            )
-            wh_acc_0.iterator[0] = _r[0]
-            wh_acc_0.iterator[1] = _r[1]
-            wh_acc_0.iterator[2] = _r[2]
-            wh_acc_0.iterator[3] = _r[3]
-            wh_acc_1.iterator[0] = _r[4]
-            wh_acc_1.iterator[1] = _r[5]
-            wh_acc_1.iterator[2] = _r[6]
-            wh_acc_1.iterator[3] = _r[7]
-            wh_acc_2.iterator[0] = _r[8]
-            wh_acc_2.iterator[1] = _r[9]
-            wh_acc_2.iterator[2] = _r[10]
-            wh_acc_2.iterator[3] = _r[11]
-            wh_acc_3.iterator[0] = _r[12]
-            wh_acc_3.iterator[1] = _r[13]
-            wh_acc_3.iterator[2] = _r[14]
-            wh_acc_3.iterator[3] = _r[15]
+            if const_expr(not self._state_only):
+                _r = _h_gemm_4v(
+                    _a_addr,
+                    _b0,
+                    _b1,
+                    _b2,
+                    _b3,
+                    wh_acc_0.iterator[0],
+                    wh_acc_0.iterator[1],
+                    wh_acc_0.iterator[2],
+                    wh_acc_0.iterator[3],
+                    wh_acc_1.iterator[0],
+                    wh_acc_1.iterator[1],
+                    wh_acc_1.iterator[2],
+                    wh_acc_1.iterator[3],
+                    wh_acc_2.iterator[0],
+                    wh_acc_2.iterator[1],
+                    wh_acc_2.iterator[2],
+                    wh_acc_2.iterator[3],
+                    wh_acc_3.iterator[0],
+                    wh_acc_3.iterator[1],
+                    wh_acc_3.iterator[2],
+                    wh_acc_3.iterator[3],
+                )
+                wh_acc_0.iterator[0] = _r[0]
+                wh_acc_0.iterator[1] = _r[1]
+                wh_acc_0.iterator[2] = _r[2]
+                wh_acc_0.iterator[3] = _r[3]
+                wh_acc_1.iterator[0] = _r[4]
+                wh_acc_1.iterator[1] = _r[5]
+                wh_acc_1.iterator[2] = _r[6]
+                wh_acc_1.iterator[3] = _r[7]
+                wh_acc_2.iterator[0] = _r[8]
+                wh_acc_2.iterator[1] = _r[9]
+                wh_acc_2.iterator[2] = _r[10]
+                wh_acc_2.iterator[3] = _r[11]
+                wh_acc_3.iterator[0] = _r[12]
+                wh_acc_3.iterator[1] = _r[13]
+                wh_acc_3.iterator[2] = _r[14]
+                wh_acc_3.iterator[3] = _r[15]
 
             # Phase 5 Step A (half-1): complete KHraw over K=64..127. The A
             # tile comes from sKsnap cols 64..127 (same col offset as sK's
@@ -2069,17 +2111,19 @@ class GdnFlushKernel:
             kh_acc_3.iterator[2] = _rkh[14]
             kh_acc_3.iterator[3] = _rkh[15]
 
+        # v10: Wait for the V cp.async to land in sV. Needed by BOTH variants:
+        # the QT@V ldmatrix (fused) and Phase-5's C = V - KH step (state_only).
+        # Same proxy as K+Q LDGSTS — no fence_view_async_shared needed.
+        _cp_async_wait_group_0()
+        sync_threads()
+
         # ============================================================
-        # OUTPUT: out = WH + QT@V
+        # OUTPUT: out = WH + QT@V   [entirely skipped in state_only]
         # ============================================================
-        _qt_a0, _qt_a1, _qt_a2, _qt_a3 = _ldmatrix_x4(sPowk, lane_id)
         _sV_base = sV.iterator.toint()
         _gOut_base = gOut.iterator.toint()
         _out_base = pid_b * so_b + pid_hv * so_hv
         _v_off_base = Int32(0)  # full V in one tile
-        # Output staging tile [T, V_PADDED] bf16 aliased onto h_buf (16 KiB;
-        # needs 4.25 KiB). sH's last read is the half-1 H GEMM; every warp is
-        # past it once the sync below (before QT@V) has run.
         # v2 flush-variant: stage outputs through sK, NOT sH. A_full (sK) is
         # dead after the half-1 H GEMM and the [T, V_PADDED] tile is an exact
         # fit (V_PADDED == K_PADDED == 136). Keeping sH untouched preserves the
@@ -2088,26 +2132,16 @@ class GdnFlushKernel:
         # C is staged into sK afterwards (it is free again post output-flush).
         _sOutStage_base = _sK_base_vl
 
-        # 4 V-groups per warp at 8 V-cols each → byte stride = 8*2 = 16 within a warp,
-        # warp_id stride in V-cols = 32 → 64 bytes between warps.
-        _qtv_base = _sV_base + _ldm_row * Int32(V_PADDED * 2) + warp_id * Int32(64)
-        # v10: Wait for the V cp.async to land in sV before ldmatrix-ing
-        # from it. V was issued before the H GEMM; the wait here drains
-        # whatever didn't finish in the H GEMM's shadow. Same proxy as
-        # K+Q LDGSTS — no fence_view_async_shared needed.
-        _cp_async_wait_group_0()
-        # (native-short-T) zero the sV working-set tail rows [n_valid:8] that were NOT
-        # loaded (v held only n_valid rows). The QT@V reduction reads the 8-row working
-        # set for t_input<=8; rows [n_valid:8] must be zero (staging supplied them
-        # before). Rows [8:16) stay garbage — proof-safe (sPowk[*,8:15]=0). tidx in
-        # [0,THREADS=128) covers V_DIM_C=128 cols; the following sync publishes it.
-        if const_expr(self._n_valid < T):
-            for _zr in cutlass.range_constexpr(self._n_valid, 8):
-                sV.iterator[_zr * V_PADDED + tidx] = io(0.0)
-        sync_threads()
-        _qtvr = _qtv_4mma(_qt_a0, _qt_a1, _qt_a2, _qt_a3, _qtv_base)
+        if const_expr(not self._state_only):
+            _qt_a0, _qt_a1, _qt_a2, _qt_a3 = _ldmatrix_x4(sPowk, lane_id)
+            # 4 V-groups per warp at 8 V-cols each → byte stride = 8*2 = 16
+            # within a warp, warp_id stride in V-cols = 32 → 64 B between warps.
+            _qtv_base = (
+                _sV_base + _ldm_row * Int32(V_PADDED * 2) + warp_id * Int32(64)
+            )
+            _qtvr = _qtv_4mma(_qt_a0, _qt_a1, _qt_a2, _qt_a3, _qtv_base)
 
-        for h_iter in cutlass.range_constexpr(4):
+        for h_iter in cutlass.range_constexpr(4 if not self._state_only else 0):
             h = warp_id * 4 + h_iter
             acc.iterator[0] = _qtvr[h_iter * 4]
             acc.iterator[1] = _qtvr[h_iter * 4 + 1]
@@ -2152,7 +2186,8 @@ class GdnFlushKernel:
         # 100% sector utilization. LDS.128 quarter-warps read 32 consecutive
         # SMEM words (pos*4 spans a full bank period) — conflict-free.
         sync_threads()
-        for _fl_pass in cutlass.range_constexpr(2 if self._t_input > 8 else 1):
+        _fl_passes = (2 if self._t_input > 8 else 1) if not self._state_only else 0
+        for _fl_pass in cutlass.range_constexpr(_fl_passes):
             _fl_chunk = _fl_pass * 128 + tidx
             _fl_row = _fl_chunk // 16
             _fl_pos = _fl_chunk & 15
@@ -2374,6 +2409,10 @@ class GdnFlushKernel:
 # ============================================================================
 
 _CACHE: dict = {}
+# Cached dummy gOut tensors for the state-only (disable_output=True) variant —
+# the kernel never touches gOut there; a tiny [1,16,HV,V] keeps the JIT
+# signature well-formed without allocating a real output every call.
+_DUMMY_OUT: dict = {}
 # Persistent pre-zeroed T=16 input staging buffers for the T<16 path, keyed by
 # (device, B, H, HK, HV, K, V, dtype, T). Reused across calls so short-T decode
 # pays only a T-row copy-in (no per-call F.pad realloc/re-zero).
@@ -2509,11 +2548,11 @@ def gated_delta_rule_mtp(
             "gdn_decode_bf16_wy_output_only: recovery_steps>0 is not supported "
             "(this is an output-only / frozen-state kernel)."
         )
-    if disable_output:
-        raise NotImplementedError(
-            "gdn_decode_bf16_wy_output_only: disable_output=True (state-only mode) "
-            "is not supported (this kernel always emits output)."
-        )
+    # disable_output=True selects the STATE-ONLY compile variant: fold the
+    # first flush_steps[i] rows into the pool and emit NO outputs (for
+    # overlapping the flush with the draft phase, or eviction/completion
+    # folds). q is accepted but never read; the call returns None.
+    _state_only = bool(disable_output)
     if intermediate_states_buffer is not None:
         raise NotImplementedError(
             "gdn_decode_bf16_wy_output_only: intermediate-state caching is not supported."
@@ -2715,6 +2754,7 @@ def gated_delta_rule_mtp(
         HV,
         H,
         V_dim,
+        _state_only,
     )
     if _qkv_rs > 0:
         cache_key = cache_key + (B, h0.shape[0])
@@ -2736,7 +2776,17 @@ def gated_delta_rule_mtp(
     # [:, :T] VIEW (zero-copy). If the caller provided `output`, honor it:
     # T==16 writes straight in; T<16 uses a scratch tile and copies the T valid
     # rows back.
-    if output is not None and T == T_KERNEL:
+    if _state_only:
+        # gOut is never written by the state-only variant; pass a tiny cached
+        # dummy so the JIT signature/strides stay well-formed.
+        dkey = (str(device), HV, V_dim, str(_io_dtype))
+        out16 = _DUMMY_OUT.get(dkey)
+        if out16 is None:
+            out16 = torch.empty(
+                1, T_KERNEL, HV, V_dim, dtype=_io_dtype, device=device
+            )
+            _DUMMY_OUT[dkey] = out16
+    elif output is not None and T == T_KERNEL:
         out16 = output
     elif _native:
         # Native (T in {4,8}): the STG writes exactly T rows, so a compact [B,T,HV,V]
@@ -2775,11 +2825,14 @@ def gated_delta_rule_mtp(
                 n_valid=n_valid,
                 qkv_row_stride=_qkv_rs,
                 ab_native=_ab_native_flag,
+                state_only=_state_only,
             ),
             *args,
         )
     _CACHE[cache_key](*args)
 
+    if _state_only:
+        return None  # state written in place; no outputs
     if output is None:
         return out16[:, :T]  # zero-copy view of the valid tokens
     if T < T_KERNEL:

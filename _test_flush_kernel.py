@@ -79,6 +79,19 @@ def run(B, regime, seed=0):
     bit_out = torch.equal(o_new, o_ref)
     p0_unchanged = torch.equal(S_new[0], S0[0])
 
+    # State-only variant (disable_output=True): the fold must be BIT-identical
+    # to the fused kernel's (same math path, output machinery compiled out).
+    S_so = S0.clone()
+    r_so = wy_flush(
+        initial_state_source=S_so,
+        disable_state_update=False,
+        disable_output=True,
+        flush_steps=P,
+        **common,
+    )
+    torch.cuda.synchronize()
+    so_bit = torch.equal(S_so, S_new) and r_so is None
+
     # Production oracle: branch kernel per-request fold of the first P_i rows.
     # accepted_steps needs K_i >= 1; fold 1 row for the P=0 slots and exclude
     # them from the comparison via `mask`.
@@ -124,10 +137,12 @@ def run(B, regime, seed=0):
     ok = (
         bit_out
         and p0_unchanged
+        and so_bit
         and e_new32 <= max(2.0 * max(e_br32, e_1632), floor)
     )
     print(
-        f"[{regime:>6} B={B:>3}] out_bit={bit_out} P0_unchanged={p0_unchanged} | "
+        f"[{regime:>6} B={B:>3}] out_bit={bit_out} P0_unchanged={p0_unchanged} "
+        f"stateonly_bit={so_bit} | "
         f"S: new-vs-32 {e_new32:.2e}  br-vs-32 {e_br32:.2e}  "
         f"seq16-vs-32 {e_1632:.2e}  new-vs-br {e_new_br:.2e}"
         f"{'' if ok else '  <-- FAIL'}",
