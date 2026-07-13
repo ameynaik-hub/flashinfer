@@ -1,0 +1,5 @@
+GPU: NVIDIA B200  HV=16 (TP4) ring gather, 33%
+B=  64 n_f= 22 (  1.8 MB moved): eager  27.78 us | graphed   9.22 us
+B= 128 n_f= 43 (  3.6 MB moved): eager  27.94 us | graphed   9.82 us
+B= 256 n_f= 85 (  7.1 MB moved): eager  27.78 us | graphed  11.23 us
+B= 512 n_f=169 ( 14.0 MB moved): eager  28.14 us | graphed  15.52 us
