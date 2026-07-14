@@ -1,0 +1,3 @@
+GPU: NVIDIA B200  B=256 sub=85 HV=16 (TP4)
+fused  kernel-B on 85: scattered-indirect  31.04 us | packed  30.88 us  (packed needed gather ~11 us on top)
+state-only fold on 85: scattered-indirect  26.93 us | packed  27.22 us  (packed needed gather ~11 us on top)

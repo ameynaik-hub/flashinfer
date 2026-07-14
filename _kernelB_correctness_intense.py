@@ -570,11 +570,86 @@ def section_j():
     print("J done", flush=True)
 
 
+def section_k():
+    print("== K. request_indices: scattered-indirect vs packed ==", flush=True)
+    H, HV = 16, 64
+    for B_full, n_sub in ((64, 21), (256, 85)):
+        i = mk(B_full, HV, H, 81)
+        g = torch.Generator().manual_seed(81 + B_full)
+        sub = (
+            torch.randperm(B_full, generator=g)[:n_sub]
+            .sort().values.to(torch.int32).to(DEV)
+        )
+        P_sub = torch.randint(0, 13, (n_sub,), generator=g).to(torch.int32).to(DEV)
+        P_sub[0] = 12
+        P_sub[1] = 0
+        base = dict(A_log=i["A_log"], dt_bias=i["dt_bias"],
+                    use_qk_l2norm_in_kernel=True, scale=SCALE)
+
+        # indirect: FULL interleaved tensors + request_indices (state slots
+        # default to the ring rows)
+        S_ind = i["state"].clone()
+        o_ind = wy_flush(**base, q=i["q"], k=i["k"], v=i["v"], a=i["a"],
+                         b=i["b"], initial_state_source=S_ind,
+                         request_indices=sub, flush_steps=P_sub,
+                         disable_state_update=False)
+        S_ind_so = i["state"].clone()
+        wy_flush(**base, q=i["q"], k=i["k"], v=i["v"], a=i["a"], b=i["b"],
+                 initial_state_source=S_ind_so, request_indices=sub,
+                 flush_steps=P_sub, disable_state_update=False,
+                 disable_output=True)
+        torch.cuda.synchronize()
+
+        # packed reference: gather the subset, state slots passed explicitly
+        sl = sub.long()
+        S_pk = i["state"].clone()
+        o_pk = wy_flush(**base,
+                        q=i["q"][sl].contiguous(), k=i["k"][sl].contiguous(),
+                        v=i["v"][sl].contiguous(), a=i["a"][sl].contiguous(),
+                        b=i["b"][sl].contiguous(),
+                        initial_state_source=S_pk,
+                        initial_state_indices=sub, flush_steps=P_sub,
+                        disable_state_update=False)
+        torch.cuda.synchronize()
+
+        tag = f"K B={B_full} sub={n_sub}"
+        if not torch.equal(S_ind, S_pk):
+            fail(tag, "indirect fold != packed fold (bit)")
+        if not torch.equal(S_ind_so, S_pk):
+            fail(tag, "indirect state-only fold != packed fold (bit)")
+        if not torch.equal(o_ind[sl], o_pk):
+            fail(tag, "indirect outputs (at ring rows) != packed outputs (bit)")
+        untouched = torch.ones(B_full, dtype=torch.bool, device=DEV)
+        untouched[sl[P_sub > 0]] = False
+        if not torch.equal(S_ind[untouched], i["state"][untouched]):
+            fail(tag, "state slots outside the folding subset modified")
+
+        # identity regression: explicit arange == default None (bit)
+        S_a = i["state"].clone()
+        P_all = torch.randint(0, 13, (B_full,), generator=g).to(torch.int32).to(DEV)
+        o_a = wy_flush(**base, q=i["q"], k=i["k"], v=i["v"], a=i["a"], b=i["b"],
+                       initial_state_source=S_a,
+                       request_indices=torch.arange(
+                           B_full, dtype=torch.int32, device=DEV),
+                       initial_state_indices=i["idx"], flush_steps=P_all,
+                       disable_state_update=False)
+        S_n = i["state"].clone()
+        o_n = wy_flush(**base, q=i["q"], k=i["k"], v=i["v"], a=i["a"], b=i["b"],
+                       initial_state_source=S_n,
+                       initial_state_indices=i["idx"], flush_steps=P_all,
+                       disable_state_update=False)
+        torch.cuda.synchronize()
+        if not torch.equal(o_a, o_n) or not torch.equal(S_a, S_n):
+            fail(tag, "explicit identity request_indices != default (bit)")
+    print("K done", flush=True)
+
+
 def main():
     torch.set_grad_enabled(False)
     print(f"GPU: {torch.cuda.get_device_name()}", flush=True)
     for s in (section_a, section_b, section_c, section_d, section_e,
-              section_f, section_g, section_h, section_i, section_j):
+              section_f, section_g, section_h, section_i, section_j,
+              section_k):
         s()
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILURE(S): {sorted(set(FAILURES))}")

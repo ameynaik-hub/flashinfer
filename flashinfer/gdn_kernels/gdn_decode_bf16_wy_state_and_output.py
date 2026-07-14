@@ -817,6 +817,7 @@ class GdnFlushKernel:
         gH0: cute.Tensor,
         gH0idx: cute.Tensor,
         gP: cute.Tensor,
+        gReqIdx: cute.Tensor,
         gOut: cute.Tensor,
         scale: cutlass.Float32,
         HV: cutlass.Int32,
@@ -860,6 +861,7 @@ class GdnFlushKernel:
             gH0,
             gH0idx,
             gP,
+            gReqIdx,
             gOut,
             scale,
             tiled_mma,
@@ -889,6 +891,7 @@ class GdnFlushKernel:
         gH0: cute.Tensor,
         gH0idx: cute.Tensor,
         gP: cute.Tensor,
+        gReqIdx: cute.Tensor,
         gOut: cute.Tensor,
         scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
@@ -958,6 +961,11 @@ class GdnFlushKernel:
         # uniform control flow; the DSL rejects tuple-unpacking MMA helpers
         # inside runtime if-regions, so only scalar stores are predicated).
         p_val = gP.iterator[pid_b]
+        # request_indices: launch position -> ring-buffer ROW for q/k/v/a/b and
+        # the output row (identity arange when the caller passes packed inputs,
+        # so default behavior is unchanged). State stays on gH0idx; flush_steps
+        # stays launch-position-indexed (all three lists are built together).
+        req_b = gReqIdx.iterator[pid_b]
 
         # v12 EXP3h: hoist γβ LDGs to ABSOLUTE START of kernel (before SMEM setup).
         # Currently they're at line ~638, AFTER lots of SMEM struct definition and
@@ -972,10 +980,10 @@ class GdnFlushKernel:
         # T staged) so tail lanes never index past the real [B,n_valid,HV] rows.
         if warp_id == 3 and lane_id < _ab_rows:
             _v7e_a_bf16 = gA.iterator[
-                pid_b * sa_b + lane_id * sa_t + pid_hv * sa_hv
+                req_b * sa_b + lane_id * sa_t + pid_hv * sa_hv
             ].to(f32)
             _v7e_b_bf16 = gB.iterator[
-                pid_b * sb_b + lane_id * sb_t + pid_hv * sb_hv
+                req_b * sb_b + lane_id * sb_t + pid_hv * sb_hv
             ].to(f32)
             _v7e_alog_bf16 = gAlog.iterator[pid_hv].to(f32)
             _v7e_dt_bf16 = gDtbias.iterator[pid_hv].to(f32)
@@ -1106,8 +1114,8 @@ class GdnFlushKernel:
         # ============================================================
         # cp.async stage 1: K + Q (8 bf16 / instr, .ca for L1 reuse)
         # ============================================================
-        k_base = pid_b * sk_b + i_h * sk_h
-        q_base = pid_b * sq_b + i_h * sq_h
+        k_base = req_b * sk_b + i_h * sk_h
+        q_base = req_b * sq_b + i_h * sq_h
         _gK_base = gK.iterator.toint()
         _gQ_base = gQ.iterator.toint()
         _sK_i32 = cute.recast_tensor(sK, cutlass.Int32)
@@ -1766,7 +1774,7 @@ class GdnFlushKernel:
         # is preserved.
         _gV_base = gV.iterator.toint()
         _sV_base_async = sV.iterator.toint()
-        _v_base_bf16 = pid_b * sv_b + pid_hv * sv_hv
+        _v_base_bf16 = req_b * sv_b + pid_hv * sv_hv
         _v_iters = 1 if self._t_input <= 8 else (T * V_DIM_C // (THREADS * 8))
         for i in cutlass.range_constexpr(_v_iters):
             _v_group = tidx + i * THREADS
@@ -2122,7 +2130,7 @@ class GdnFlushKernel:
         # ============================================================
         _sV_base = sV.iterator.toint()
         _gOut_base = gOut.iterator.toint()
-        _out_base = pid_b * so_b + pid_hv * so_hv
+        _out_base = req_b * so_b + pid_hv * so_hv
         _v_off_base = Int32(0)  # full V in one tile
         # v2 flush-variant: stage outputs through sK, NOT sH. A_full (sK) is
         # dead after the half-1 H GEMM and the [T, V_PADDED] tile is an exact
@@ -2429,6 +2437,8 @@ class GdnFlushKernel:
 # ============================================================================
 
 _CACHE: dict = {}
+# Cached identity request_indices (arange) per (device, B) — see the wrapper.
+_IDENTITY_IDX: dict = {}
 # Cached dummy gOut tensors for the state-only (disable_output=True) variant —
 # the kernel never touches gOut there; a tiny [1,16,HV,V] keeps the JIT
 # signature well-formed without allocating a real output every call.
@@ -2511,6 +2521,7 @@ def gated_delta_rule_mtp(
     initial_state_source: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     flush_steps: Optional[torch.Tensor] = None,
+    request_indices: Optional[torch.Tensor] = None,
     output_state_indices: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     accepted_steps: Optional[torch.Tensor] = None,
@@ -2537,8 +2548,13 @@ def gated_delta_rule_mtp(
     zero rows still decay the state), a CONTIGUOUS state pool (written in
     place), ``flush_steps`` int32 [B], and ``disable_state_update=False``.
 
-    Returns ``output`` of shape ``[B, 16, HV, V]`` (bf16); the caller slices
-    each request's draft rows ``[P_i : P_i+T]``.
+    ``request_indices`` (optional int32 [launch_B]) maps launch position ->
+    ring-buffer row, so a launch can cover a scattered subset of an interleaved
+    ring with no gather; outputs land at the same rows of ``output``.
+
+    Returns ``output`` of shape ``[B, 16, HV, V]`` (bf16; B = the ring tensor's
+    batch size); the caller slices each request's draft rows ``[P_i : P_i+T]``
+    at its ring row.
     """
     assert q is not None and k is not None and v is not None
     assert b is not None and initial_state_source is not None
@@ -2615,10 +2631,42 @@ def gated_delta_rule_mtp(
 
     if scale is None:
         scale = 1.0 / math.sqrt(K_dim)
+    # request_indices: launch position -> ring-buffer row (int32 [launch_B]).
+    # Lets a launch cover a SUBSET of an interleaved ring buffer with no gather
+    # (q/k/v/a/b and the output row are read/written at request_indices[b]).
+    # None = identity (packed inputs, unchanged behavior). flush_steps and
+    # initial_state_indices are launch-position-indexed, aligned with it; when
+    # initial_state_indices is omitted alongside request_indices, state slots
+    # default to the ring rows (slot == row).
+    if request_indices is not None:
+        assert request_indices.dtype == torch.int32, (
+            f"request_indices must be int32; got {request_indices.dtype}."
+        )
+        request_indices = request_indices.contiguous()
+        launch_B = request_indices.shape[0]
+    else:
+        launch_B = B
+        # Cached identity list: a per-call torch.arange launches an extra
+        # kernel + allocation on EVERY invocation (measured: 31 -> 177 us at
+        # B=85/TP4 under the CUPTI cold-L2 harness) and breaks pointer
+        # stability under CUDA graphs. Values are constant; cache by (dev, B).
+        ikey = (str(device), B)
+        request_indices = _IDENTITY_IDX.get(ikey)
+        if request_indices is None:
+            request_indices = torch.arange(B, dtype=torch.int32, device=device)
+            _IDENTITY_IDX[ikey] = request_indices
+    assert flush_steps.shape[0] == launch_B, (
+        f"flush_steps must have launch_B={launch_B} entries; got "
+        f"{flush_steps.shape[0]}."
+    )
     if initial_state_indices is None:
-        initial_state_indices = torch.arange(B, dtype=torch.int32, device=device)
+        initial_state_indices = request_indices
     else:
         initial_state_indices = initial_state_indices.contiguous()
+        assert initial_state_indices.shape[0] == launch_B, (
+            f"initial_state_indices must have launch_B={launch_B} entries; got "
+            f"{initial_state_indices.shape[0]}."
+        )
     _io_dtype = q.dtype
     HK = k.shape[2]
 
@@ -2828,6 +2876,7 @@ def gated_delta_rule_mtp(
         mk_dyn(h0),
         mk_dyn(initial_state_indices),
         mk_dyn(flush_steps),
+        mk_dyn(request_indices),
         mk_dyn(out16),
         scale,
         HV,

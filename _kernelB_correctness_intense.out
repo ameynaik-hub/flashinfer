@@ -24,5 +24,7 @@ H done
 I done
 == J. concurrent-stream overlap ==
 J done
+== K. request_indices: scattered-indirect vs packed ==
+K done
 
 ALL SECTIONS PASS
