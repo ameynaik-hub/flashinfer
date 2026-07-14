@@ -6,9 +6,7 @@ SCATTERED rows of the full interleaved ring via request_indices. CUPTI cold-L2.
   out16_all : wy_output_only, all B (verify baseline / (c) critical path)
   a_mixed   : ONE kernel-B launch, all B, 33% flush_steps>0 (option a)
   fl_ind    : kernel B fused on the 33% — SCATTERED via request_indices
-  ln_kB_ind : kernel B (flush_steps=0) on the 67% — SCATTERED (lean stand-in;
-              wy_output_only has no indirection yet, so this is the zero-
-              packing lean option available today)
+  ln_wy_ind : wy_output_only on the 67% — SCATTERED via request_indices
   b_ind     : graphed pair fl_ind + ln_kB_ind  (split, zero packing)
   so_ind    : state-only fold on the 33% — SCATTERED ((c) draft-window fold,
               zero gather)
@@ -39,7 +37,7 @@ def main():
     print(f"GPU: {torch.cuda.get_device_name()}  HV={HV} H={H} (TP4), 33% "
           f"flush, SCATTERED subsets via request_indices, CUPTI cold-L2\n")
     hdr = (f"{'BS':>4} | {'out16_all':>9} {'a_mixed':>8} | {'fl_ind':>7} "
-           f"{'ln_kB_ind':>9} {'b_ind':>7} | {'so_ind':>7}")
+           f"{'ln_wy_ind':>9} {'b_ind':>7} | {'so_ind':>7}")
     print(hdr)
     print("-" * len(hdr))
     for B in (64, 128, 256, 512):
@@ -79,18 +77,17 @@ def main():
                                        initial_state_source=state,
                                        request_indices=fl, flush_steps=p_fl,
                                        disable_state_update=False))
-        ln_ind = t_us(lambda: wy_flush(**tok, **common,
-                                       initial_state_source=state,
-                                       request_indices=ln, flush_steps=p_ln0,
-                                       disable_state_update=False))
+        ln_ind = t_us(lambda: wy_out(**tok, **common,
+                                     initial_state_source=state,
+                                     request_indices=ln,
+                                     disable_state_update=True))
 
         def b_pair():
             wy_flush(**tok, **common, initial_state_source=state,
                      request_indices=fl, flush_steps=p_fl,
                      disable_state_update=False)
-            wy_flush(**tok, **common, initial_state_source=state,
-                     request_indices=ln, flush_steps=p_ln0,
-                     disable_state_update=False)
+            wy_out(**tok, **common, initial_state_source=state,
+                   request_indices=ln, disable_state_update=True)
 
         b_ind = t_us(b_pair, graph=True)
         so_ind = t_us(lambda: wy_flush(**tok, **common,

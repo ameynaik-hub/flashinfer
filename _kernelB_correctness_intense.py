@@ -624,6 +624,20 @@ def section_k():
         if not torch.equal(S_ind[untouched], i["state"][untouched]):
             fail(tag, "state slots outside the folding subset modified")
 
+        # wy_output_only scattered-indirect vs packed (outputs only, T=16)
+        o_wo_ind = wy_out(**base, q=i["q"], k=i["k"], v=i["v"], a=i["a"],
+                          b=i["b"], initial_state_source=i["state"].clone(),
+                          request_indices=sub, disable_state_update=True)
+        o_wo_pk = wy_out(**base,
+                         q=i["q"][sl].contiguous(), k=i["k"][sl].contiguous(),
+                         v=i["v"][sl].contiguous(), a=i["a"][sl].contiguous(),
+                         b=i["b"][sl].contiguous(),
+                         initial_state_source=i["state"].clone(),
+                         initial_state_indices=sub, disable_state_update=True)
+        torch.cuda.synchronize()
+        if not torch.equal(o_wo_ind[sl], o_wo_pk):
+            fail(tag, "wy_output_only indirect outputs != packed (bit)")
+
         # identity regression: explicit arange == default None (bit)
         S_a = i["state"].clone()
         P_all = torch.randint(0, 13, (B_full,), generator=g).to(torch.int32).to(DEV)

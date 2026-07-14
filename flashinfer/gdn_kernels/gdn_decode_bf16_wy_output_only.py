@@ -728,6 +728,7 @@ class GdnDecodeKernel:
         gDtbias: cute.Tensor,
         gH0: cute.Tensor,
         gH0idx: cute.Tensor,
+        gReqIdx: cute.Tensor,
         gOut: cute.Tensor,
         scale: cutlass.Float32,
         HV: cutlass.Int32,
@@ -770,6 +771,7 @@ class GdnDecodeKernel:
             gDtbias,
             gH0,
             gH0idx,
+            gReqIdx,
             gOut,
             scale,
             tiled_mma,
@@ -798,6 +800,7 @@ class GdnDecodeKernel:
         gDtbias: cute.Tensor,
         gH0: cute.Tensor,
         gH0idx: cute.Tensor,
+        gReqIdx: cute.Tensor,
         gOut: cute.Tensor,
         scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
@@ -862,6 +865,10 @@ class GdnDecodeKernel:
         # GQA head mapping
         i_h = pid_hv // (HV // H)
         cache_idx = gH0idx.iterator[pid_b]
+        # request_indices: launch position -> ring/batch ROW for q/k/v/a/b and
+        # the output row (identity when the caller passes packed inputs, so
+        # default behavior and cost are unchanged: one extra per-CTA LDG).
+        req_b = gReqIdx.iterator[pid_b]
 
         # v12 EXP3h: hoist γβ LDGs to ABSOLUTE START of kernel (before SMEM setup).
         # Currently they're at line ~638, AFTER lots of SMEM struct definition and
@@ -876,10 +883,10 @@ class GdnDecodeKernel:
         # T staged) so tail lanes never index past the real [B,n_valid,HV] rows.
         if warp_id == 3 and lane_id < _ab_rows:
             _v7e_a_bf16 = gA.iterator[
-                pid_b * sa_b + lane_id * sa_t + pid_hv * sa_hv
+                req_b * sa_b + lane_id * sa_t + pid_hv * sa_hv
             ].to(f32)
             _v7e_b_bf16 = gB.iterator[
-                pid_b * sb_b + lane_id * sb_t + pid_hv * sb_hv
+                req_b * sb_b + lane_id * sb_t + pid_hv * sb_hv
             ].to(f32)
             _v7e_alog_bf16 = gAlog.iterator[pid_hv].to(f32)
             _v7e_dt_bf16 = gDtbias.iterator[pid_hv].to(f32)
@@ -998,8 +1005,8 @@ class GdnDecodeKernel:
         # ============================================================
         # cp.async stage 1: K + Q (8 bf16 / instr, .ca for L1 reuse)
         # ============================================================
-        k_base = pid_b * sk_b + i_h * sk_h
-        q_base = pid_b * sq_b + i_h * sq_h
+        k_base = req_b * sk_b + i_h * sk_h
+        q_base = req_b * sq_b + i_h * sq_h
         _gK_base = gK.iterator.toint()
         _gQ_base = gQ.iterator.toint()
         _sK_i32 = cute.recast_tensor(sK, cutlass.Int32)
@@ -1611,7 +1618,7 @@ class GdnDecodeKernel:
         # is preserved.
         _gV_base = gV.iterator.toint()
         _sV_base_async = sV.iterator.toint()
-        _v_base_bf16 = pid_b * sv_b + pid_hv * sv_hv
+        _v_base_bf16 = req_b * sv_b + pid_hv * sv_hv
         _v_iters = 1 if self._t_input <= 8 else (T * V_DIM_C // (THREADS * 8))
         for i in cutlass.range_constexpr(_v_iters):
             _v_group = tidx + i * THREADS
@@ -1855,7 +1862,7 @@ class GdnDecodeKernel:
         _qt_a0, _qt_a1, _qt_a2, _qt_a3 = _ldmatrix_x4(sPowk, lane_id)
         _sV_base = sV.iterator.toint()
         _gOut_base = gOut.iterator.toint()
-        _out_base = pid_b * so_b + pid_hv * so_hv
+        _out_base = req_b * so_b + pid_hv * so_hv
         _v_off_base = Int32(0)  # full V in one tile
         # Output staging tile [T, V_PADDED] bf16 aliased onto h_buf (16 KiB;
         # needs 4.25 KiB). sH's last read is the half-1 H GEMM; every warp is
@@ -1965,6 +1972,10 @@ class GdnDecodeKernel:
 # ============================================================================
 
 _CACHE: dict = {}
+# Cached identity request_indices (arange) per (device, B): a per-call
+# torch.arange would add a kernel + allocation on every invocation and break
+# pointer stability under CUDA graphs.
+_IDENTITY_IDX: dict = {}
 # Persistent pre-zeroed T=16 input staging buffers for the T<16 path, keyed by
 # (device, B, H, HK, HV, K, V, dtype, T). Reused across calls so short-T decode
 # pays only a T-row copy-in (no per-call F.pad realloc/re-zero).
@@ -2042,6 +2053,7 @@ def gated_delta_rule_mtp(
     b: Optional[torch.Tensor] = None,
     initial_state_source: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
+    request_indices: Optional[torch.Tensor] = None,
     output_state_indices: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     accepted_steps: Optional[torch.Tensor] = None,
@@ -2119,10 +2131,36 @@ def gated_delta_rule_mtp(
 
     if scale is None:
         scale = 1.0 / math.sqrt(K_dim)
-    if initial_state_indices is None:
-        initial_state_indices = torch.arange(B, dtype=torch.int32, device=device)
+    # request_indices: launch position -> ring/batch row for q/k/v/a/b and the
+    # output row (int32 [launch_B]); lets a launch cover a SCATTERED subset of
+    # interleaved buffers with no gather. Restricted to the full 16-row window
+    # form (T == 16): the T<16 staging/native paths copy or re-stride inputs
+    # per batch row and would silently disagree with the indirection.
+    if request_indices is not None:
+        assert T == T_KERNEL, (
+            "request_indices requires the full 16-row window (T == 16); "
+            f"got T={T}."
+        )
+        assert request_indices.dtype == torch.int32, (
+            f"request_indices must be int32; got {request_indices.dtype}."
+        )
+        request_indices = request_indices.contiguous()
+        launch_B = request_indices.shape[0]
+        if initial_state_indices is None:
+            initial_state_indices = request_indices  # slot == ring row
+        else:
+            initial_state_indices = initial_state_indices.contiguous()
+            assert initial_state_indices.shape[0] == launch_B
     else:
-        initial_state_indices = initial_state_indices.contiguous()
+        ikey = (str(device), B)
+        request_indices = _IDENTITY_IDX.get(ikey)
+        if request_indices is None:
+            request_indices = torch.arange(B, dtype=torch.int32, device=device)
+            _IDENTITY_IDX[ikey] = request_indices
+        if initial_state_indices is None:
+            initial_state_indices = request_indices
+        else:
+            initial_state_indices = initial_state_indices.contiguous()
     _io_dtype = q.dtype
     HK = k.shape[2]
 
@@ -2315,6 +2353,7 @@ def gated_delta_rule_mtp(
         mk(dt_bias, 16),
         mk_dyn(h0),
         mk_dyn(initial_state_indices),
+        mk_dyn(request_indices),
         mk_dyn(out16),
         scale,
         HV,
