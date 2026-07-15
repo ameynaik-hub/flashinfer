@@ -1,0 +1,36 @@
+========= COMPUTE-SANITIZER
+========= Warning: Race reported between Read access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o4412820485121281_tensorptrbf16gmemalign16o4412820485121281_ten_0+0x4210
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o4412820485121281_tensorptrbf16gmemalign16o4412820485121281_ten_0+0x4440 [13888 hazards]
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o4412820485121281_tensorptrbf16gmemalign16o4412820485121281_ten_0+0x4470 [12028 hazards]
+========= 
+========= Warning: Race reported between Read access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o4412820485121281_tensorptrbf16gmemalign16o4412820485121281_ten_0+0x4230
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o4412820485121281_tensorptrbf16gmemalign16o4412820485121281_ten_0+0x44b0 [13888 hazards]
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o4412820485121281_tensorptrbf16gmemalign16o4412820485121281_ten_0+0x4660 [12028 hazards]
+========= 
+========= Warning: Race reported between Read access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o4412820485121281_tensorptrbf16gmemalign16o4412820485121281_ten_0+0x4290
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o4412820485121281_tensorptrbf16gmemalign16o4412820485121281_ten_0+0x46a0 [13888 hazards]
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o4412820485121281_tensorptrbf16gmemalign16o4412820485121281_ten_0+0x46c0 [12028 hazards]
+========= 
+========= Warning: Race reported between Read access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o4412820485121281_tensorptrbf16gmemalign16o4412820485121281_ten_0+0x42a0
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o4412820485121281_tensorptrbf16gmemalign16o4412820485121281_ten_0+0x46d0 [13888 hazards]
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o4412820485121281_tensorptrbf16gmemalign16o4412820485121281_ten_0+0x46e0 [12028 hazards]
+========= 
+========= Warning: Race reported between Read access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o16412881925121281_tensorptrbf16gmemalign16o16412881925121281_t_0+0x5720
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o16412881925121281_tensorptrbf16gmemalign16o16412881925121281_t_0+0x5a50 [15872 hazards]
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o16412881925121281_tensorptrbf16gmemalign16o16412881925121281_t_0+0x5a90 [15872 hazards]
+========= 
+========= Warning: Race reported between Read access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o16412881925121281_tensorptrbf16gmemalign16o16412881925121281_t_0+0x5750
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o16412881925121281_tensorptrbf16gmemalign16o16412881925121281_t_0+0x5bf0 [15872 hazards]
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o16412881925121281_tensorptrbf16gmemalign16o16412881925121281_t_0+0x5c20 [15872 hazards]
+========= 
+========= Warning: Race reported between Read access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o16412881925121281_tensorptrbf16gmemalign16o16412881925121281_t_0+0x56d0
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o16412881925121281_tensorptrbf16gmemalign16o16412881925121281_t_0+0x58d0 [15744 hazards]
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o16412881925121281_tensorptrbf16gmemalign16o16412881925121281_t_0+0x58f0 [15744 hazards]
+========= 
+========= Warning: Race reported between Read access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o16412881925121281_tensorptrbf16gmemalign16o16412881925121281_t_0+0x5740
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o16412881925121281_tensorptrbf16gmemalign16o16412881925121281_t_0+0x5ae0 [15744 hazards]
+=========     and Write access at kernel_cutlass_kernel_flashinfergdn_kernelsgdn_decode_bf16_wy_output_onlyGdnDecodeKernel_object_at__tensorptrbf16gmemalign16o16412881925121281_tensorptrbf16gmemalign16o16412881925121281_t_0+0x5ba0 [15744 hazards]
+========= 
+MODULE: /home/scratch.ameyn_gpu_2/flashinfer-pr3720/flashinfer/gdn_kernels/gdn_decode_bf16_wy_output_only.py
+OLD_TARGET_DONE
+========= RACECHECK SUMMARY: 8 hazards displayed (0 errors, 8 warnings)

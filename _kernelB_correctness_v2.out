@@ -1,0 +1,17 @@
+GPU: NVIDIA B200  [campaign v2 — REPORT ONLY]
+== L. new GQA ratios / big shapes / deep seeds ==
+  (H=16, HV=16) done
+  (H=8, HV=64) done
+  (H=4, HV=64) done
+  (H=16, HV=64) done
+L done
+== M. request_indices stress ==
+M done
+== N. property oracles ==
+N done
+== P. 300-replay graph soak (both kernels) ==
+P done
+== Q. 4-stream disjoint torture ==
+Q done
+
+ALL V2 SECTIONS PASS
