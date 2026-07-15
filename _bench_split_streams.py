@@ -1,6 +1,9 @@
 """(b) split pair: sequential same-stream vs concurrent 2-stream (fork-join),
-both CUDA-graph-captured, event-timed (warm-L2; the DELTA is the signal).
-TP4 (HV=16,H=4), 33% flush, scattered via request_indices."""
+both CUDA-graph-captured, event-timed, COLD L2 via rotating buffer copies
+(q/k/v/a/b/state passed as input_kwargs so bench_gpu_time rotates them;
+A_log/dt_bias/index tensors stay closure-bound: per-layer-constant cache
+contract + fixed graph pointers). TP4 (HV=16,H=4), 33% flush, scattered
+request_indices."""
 import math
 import numpy as np
 import torch
@@ -16,23 +19,23 @@ H, HV, K, V = 4, 16, 128, 128
 SCALE = 1.0 / math.sqrt(K)
 torch.set_grad_enabled(False)
 print(f"GPU: {torch.cuda.get_device_name()}  (b)-pair seq vs 2-stream, "
-      f"graphed event timing\n")
+      f"graphed event timing, COLD L2 (rotating buffers)\n")
 side = torch.cuda.Stream()
 ev_fork = torch.cuda.Event()
 ev_join = torch.cuda.Event()
 for B in (64, 128, 256, 512):
     n_f = (B * 33 + 99) // 100
     with torch.device("cuda"):
-        tok = dict(
+        buf = dict(
             q=torch.randn(B, 16, H, K, dtype=torch.bfloat16),
             k=torch.randn(B, 16, H, K, dtype=torch.bfloat16),
             v=torch.randn(B, 16, HV, V, dtype=torch.bfloat16),
             a=torch.randn(B, 16, HV, dtype=torch.bfloat16) * 0.1,
             b=torch.randn(B, 16, HV, dtype=torch.bfloat16),
+            state=torch.randn(B, HV, V, K, dtype=torch.bfloat16),
         )
         A_log = torch.randn(HV, dtype=torch.float32) * 0.1
         dt_bias = torch.randn(HV, dtype=torch.float32) * 0.1
-        state = torch.randn(B, HV, V, K, dtype=torch.bfloat16)
     g = torch.Generator().manual_seed(0)
     perm = torch.randperm(B, generator=g)
     fl = perm[:n_f].sort().values.to(torch.int32).to("cuda")
@@ -41,13 +44,15 @@ for B in (64, 128, 256, 512):
     cm = dict(A_log=A_log, dt_bias=dt_bias, use_qk_l2norm_in_kernel=True,
               scale=SCALE)
 
-    def seq_pair():
+    def seq_pair(q, k, v, a, b, state):
+        tok = dict(q=q, k=k, v=v, a=a, b=b)
         wy_flush(**tok, **cm, initial_state_source=state, request_indices=fl,
                  flush_steps=p_fl, disable_state_update=False)
         wy_out(**tok, **cm, initial_state_source=state, request_indices=ln,
                disable_state_update=True)
 
-    def con_pair():
+    def con_pair(q, k, v, a, b, state):
+        tok = dict(q=q, k=k, v=v, a=a, b=b)
         cur = torch.cuda.current_stream()
         ev_fork.record(cur)
         side.wait_event(ev_fork)
@@ -63,7 +68,8 @@ for B in (64, 128, 256, 512):
     def t(fn):
         return np.median(bench_gpu_time(fn, dry_run_iters=10, repeat_iters=300,
                                         enable_cupti=False, use_cuda_graph=True,
-                                        cold_l2_cache=True)) * 1000
+                                        cold_l2_cache=True,
+                                        input_kwargs=buf)) * 1000
 
     seq = t(seq_pair)
     con = t(con_pair)

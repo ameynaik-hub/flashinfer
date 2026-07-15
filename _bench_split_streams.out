@@ -1,10 +1,6 @@
-/home/scratch.ameyn_gpu_2/flashinfer_state_output_optimization/flashinfer/testing/utils.py:1674: UserWarning: cold_l2_cache=True but no GPU tensors found in input_args/input_kwargs. Cold L2 benchmarking disabled.
-  return bench_gpu_time_with_cudagraph(
-/home/scratch.ameyn_gpu_2/flashinfer_state_output_optimization/flashinfer/testing/utils.py:1674: UserWarning: cold_l2_cache=True but no GPU tensors found in input_args/input_kwargs. Cold L2 benchmarking disabled.
-  return bench_gpu_time_with_cudagraph(
-GPU: NVIDIA B200  (b)-pair seq vs 2-stream, graphed event timing
+GPU: NVIDIA B200  (b)-pair seq vs 2-stream, graphed event timing, COLD L2 (rotating buffers)
 
-BS=  64: sequential   19.42 us | 2-stream   15.52 us | speedup  1.25x
-BS= 128: sequential   30.67 us | 2-stream   26.99 us | speedup  1.14x
-BS= 256: sequential   58.41 us | 2-stream   52.18 us | speedup  1.12x
-BS= 512: sequential  111.77 us | 2-stream  109.71 us | speedup  1.02x
+BS=  64: sequential   22.69 us | 2-stream   17.13 us | speedup  1.32x
+BS= 128: sequential   34.36 us | 2-stream   28.21 us | speedup  1.22x
+BS= 256: sequential   58.72 us | 2-stream   53.18 us | speedup  1.10x
+BS= 512: sequential  111.24 us | 2-stream  110.01 us | speedup  1.01x
