@@ -216,14 +216,23 @@ def parse_gdn_args(line, parser):
         required=False,
         nargs="+",
         default=["flashinfer"],
-        choices=["flashinfer", "triton", "fla", "rubin", "rubin_ugpu"],
+        choices=[
+            "flashinfer",
+            "flashinfer_generic",
+            "triton",
+            "fla",
+            "rubin",
+            "rubin_ugpu",
+        ],
         help="Kernel backends to benchmark. 'triton' is available for "
         "decode/MTP; 'fla' (flash-linear-attention) for prefill; 'rubin' "
         "(the Rubin-tuned T=1 kernel, SM107 only) for decode with bfloat16 "
         "state; 'rubin_ugpu' is 'rubin' with uGPU localization (a "
         "ugpu_state_pool: each die updates the half of every state in its own "
-        "memory). On decode, "
-        "'flashinfer' is the generic FlashInfer kernel.",
+        "memory). On decode, 'flashinfer' is the public API with its default "
+        "dispatch (backend='auto', which may pick Cake GDN or, on SM107, the "
+        "Rubin kernel) and 'flashinfer_generic' forces the generic FlashInfer "
+        "kernel (backend='flashinfer').",
     )
 
     args = parser.parse_args(line)
@@ -592,7 +601,10 @@ def _testGdnDecodeLike(args, seq_len):
         print(f"[VVERBOSE] {use_qk_l2norm = }, {state_writeback = }")
 
     def run_backend(backend, state):
-        if backend == "flashinfer":
+        if backend in ("flashinfer", "flashinfer_generic"):
+            # "flashinfer": the API's default dispatch, what users get (and what this
+            # benchmark has always timed); "flashinfer_generic": the generic kernel only.
+            api_backend = "flashinfer" if backend == "flashinfer_generic" else "auto"
             if is_mtp:
                 if use_bf16_state:
                     # BF16 MTP path is reached through the pretranspose API
@@ -635,8 +647,6 @@ def _testGdnDecodeLike(args, seq_len):
             # BF16 state always goes through the pool path with pre-allocated
             # indices: the non-pool API path synthesizes an arange index
             # tensor per call, whose tiny kernel would pollute CUPTI timing.
-            # backend="flashinfer": the generic kernel, also on SM107 where
-            # "auto" would pick the Rubin-tuned one (see the "rubin" backend).
             if pool_split or use_bf16_state:
                 return gated_delta_rule_decode_pretranspose(
                     q,
@@ -653,7 +663,7 @@ def _testGdnDecodeLike(args, seq_len):
                     initial_state=state,
                     initial_state_indices=initial_state_indices,
                     output_state_indices=output_state_indices,
-                    backend="flashinfer",
+                    backend=api_backend,
                 )[0]
             return gated_delta_rule_decode_pretranspose(
                 q,
@@ -667,7 +677,7 @@ def _testGdnDecodeLike(args, seq_len):
                 scale,
                 output,
                 use_qk_l2norm,
-                backend="flashinfer",
+                backend=api_backend,
             )[0]
         elif backend == "rubin_ugpu":
             # Rubin kernel with uGPU localization; refcheck passes a fresh copy of
